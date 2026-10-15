@@ -1,59 +1,76 @@
 #!/usr/bin/env bun
 /**
- * peer-mail from a shell: see who has joined, message a session, read what a session received.
+ * peer-mail from a shell: see the swarms and their members, message a member, read what one received.
  *
- *   peer-mail list
- *   peer-mail send <to|all> <message…> [--from <name>]    (default sender: human)
- *   peer-mail history <name> [--limit N]
+ *   peer-mail swarms
+ *   peer-mail list <swarm>
+ *   peer-mail send <swarm> <to|all> <message…>     (sent as "human")
+ *   peer-mail history <swarm> <name> [--limit N]
  *
  * Uses the same directory as the extension (PEER_MAIL_DIR, default ~/.omp/peer-mail).
  */
 import { parseArgs } from "node:util";
-import { HUMAN, Transport } from "./transport";
+import { HUMAN, listSwarms, Swarm } from "./transport";
 
 const USAGE = `usage:
-  peer-mail list
-  peer-mail send <to|all> <message...> [--from <name>]
-  peer-mail history <name> [--limit N]`;
+  peer-mail swarms
+  peer-mail list <swarm>
+  peer-mail send <swarm> <to|all> <message...>
+  peer-mail history <swarm> <name> [--limit N]`;
 
 const { positionals, values } = parseArgs({
 	allowPositionals: true,
-	options: { from: { type: "string", default: HUMAN }, limit: { type: "string", default: "20" } },
+	options: { limit: { type: "string", default: "20" } },
 });
-const [command, ...rest] = positionals;
-const transport = new Transport();
+const [command, swarmName, ...rest] = positionals;
 
 try {
-	switch (command) {
-		case "list": {
-			const peers = transport.peers();
-			if (peers.length === 0) console.log("No peers have joined yet.");
-			for (const peer of peers) {
-				const state = transport.isOnline(peer) ? "online " : "offline";
-				const waiting = transport.pending(peer.name);
-				console.log(`${peer.name.padEnd(24)} ${state}  ${waiting ? `${waiting} waiting  ` : ""}${peer.cwd}`);
-			}
-			break;
+	if (command === "swarms") {
+		const names = listSwarms();
+		if (names.length === 0) console.log("No swarms yet.");
+		for (const name of names) {
+			const swarm = new Swarm(name);
+			const peers = swarm.peers();
+			const online = peers.filter(peer => swarm.isOnline(peer)).length;
+			const started = new Date(swarm.phase()?.startedAt ?? 0).toISOString().replace("T", " ").slice(0, 19);
+			console.log(`${name.padEnd(28)} ${online}/${peers.length} online  started ${started}`);
 		}
-		case "send": {
-			const [to, ...words] = rest;
-			if (!to || words.length === 0) throw new Error(USAGE);
-			for (const message of transport.send(values.from, to, words.join(" "))) {
-				console.log(`sent to ${message.to} (id ${message.id})`);
+	} else {
+		if (!swarmName) throw new Error(USAGE);
+		const swarm = new Swarm(swarmName);
+		const phase = swarm.phase();
+		if (!phase) throw new Error(`No swarm called "${swarmName}".`);
+		switch (command) {
+			case "list": {
+				const peers = swarm.peers();
+				if (peers.length === 0) console.log("No members.");
+				for (const peer of peers) {
+					const state = swarm.isOnline(peer) ? "online " : "offline";
+					const waiting = swarm.pending(peer.name);
+					console.log(`${peer.name.padEnd(24)} ${state}  ${waiting ? `${waiting} waiting  ` : ""}${peer.cwd}`);
+				}
+				break;
 			}
-			break;
-		}
-		case "history": {
-			const [name] = rest;
-			if (!name) throw new Error(USAGE);
-			for (const message of transport.history(name, Number(values.limit))) {
-				const when = new Date(message.sentAt).toISOString().replace("T", " ").slice(0, 19);
-				console.log(`[${when}] ${message.from} → ${message.to}  (${message.id})\n${message.body}\n`);
+			case "send": {
+				const [to, ...words] = rest;
+				if (!to || words.length === 0) throw new Error(USAGE);
+				for (const message of swarm.send(HUMAN, phase.id, to, words.join(" "))) {
+					console.log(`sent to ${message.to} (id ${message.id})`);
+				}
+				break;
 			}
-			break;
+			case "history": {
+				const [name] = rest;
+				if (!name) throw new Error(USAGE);
+				for (const message of swarm.history(name, Number(values.limit))) {
+					const when = new Date(message.sentAt).toISOString().replace("T", " ").slice(0, 19);
+					console.log(`[${when}] ${message.from} → ${message.to}  (${message.id})\n${message.body}\n`);
+				}
+				break;
+			}
+			default:
+				throw new Error(USAGE);
 		}
-		default:
-			throw new Error(USAGE);
 	}
 } catch (error) {
 	console.error((error as Error).message);

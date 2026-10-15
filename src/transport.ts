@@ -1,21 +1,35 @@
 /**
- * The shared mail directory every omp session on this machine reads and writes.
+ * The shared mail directory, split into swarms. Only sessions that joined a swarm can mail;
+ * every other session is isolated.
  *
- *   <root>/peers/<name>.json             a session that has joined: pid, cwd, last heartbeat
- *   <root>/inbox/<name>/<id>.json        mail waiting for <name>
- *   <root>/delivered/<name>/<id>.json    mail <name> has received (its history)
+ *   <root>/swarms/<swarm>/phase.json                   the current phase: who started it, when
+ *   <root>/swarms/<swarm>/peers/<name>.json            a member: pid, cwd, phase, last heartbeat
+ *   <root>/swarms/<swarm>/inbox/<name>/<id>.json       mail waiting for <name>
+ *   <root>/swarms/<swarm>/delivered/<name>/<id>.json   mail <name> has received (its history)
  *
- * Files are written to a temp name and renamed into place, so a reader never sees half a
- * message. A session receives a message by renaming it from inbox/ to delivered/: rename is
- * atomic, so exactly one session gets each message even if two poll at once.
+ * `/startswarm` begins a new phase: the swarm's directory is deleted and recreated, so earlier
+ * members and their mail are gone. A session still holding the old phase id is stale: its
+ * heartbeat, sends and receives are refused, and anything it manages to write carries the old
+ * phase and is ignored by the new one.
+ *
+ * Files are written to a temp name and renamed into place, so a reader never sees half a message.
+ * A message is received by renaming it from inbox/ to delivered/: rename is atomic, so exactly one
+ * session gets each message even if two poll at once.
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+export interface Phase {
+	id: string;
+	startedAt: number;
+	startedBy: string;
+}
+
 export interface Peer {
 	name: string;
+	phase: string;
 	/** null once the session has left (its name and mail stay for when it returns). */
 	pid: number | null;
 	host: string;
@@ -26,6 +40,7 @@ export interface Peer {
 
 export interface Message {
 	id: string;
+	phase: string;
 	from: string;
 	to: string;
 	body: string;
@@ -33,22 +48,29 @@ export interface Message {
 	replyTo?: string;
 }
 
-/** How often a joined session refreshes its peers/ entry. */
+/** How often a member refreshes its peers/ entry. */
 export const HEARTBEAT_MS = 5_000;
-/** A peer silent for longer than this is offline, whatever its pid says (crashed, or asleep). */
+/** A member silent for longer than this is offline, whatever its pid says (crashed, or asleep). */
 export const STALE_MS = 3 * HEARTBEAT_MS;
-/** Name for mail sent from the command line rather than a session. */
+/** Sender name for mail from the command line rather than a member. */
 export const HUMAN = "human";
-/** `to` value that sends one copy to every other known peer. */
+/** `to` value that sends one copy to every other member. */
 export const BROADCAST = "all";
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/;
+
+/** Raised when a session acts on a phase that `/startswarm` has since replaced. */
+export class StalePhaseError extends Error {
+	constructor(readonly swarm: string) {
+		super(`Swarm "${swarm}" was restarted with /startswarm; this session is no longer in it.`);
+	}
+}
 
 export function defaultRoot(): string {
 	return process.env.PEER_MAIL_DIR || path.join(os.homedir(), ".omp", "peer-mail");
 }
 
-/** A raw name (a directory name, a user's choice) made safe as a peer name, or an error. */
+/** A raw name (a swarm, a member) made safe for a directory name, or an error. */
 export function normalizeName(raw: string): string {
 	const name = raw
 		.trim()
@@ -56,7 +78,7 @@ export function normalizeName(raw: string): string {
 		.replace(/[^a-z0-9._-]+/g, "-")
 		.replace(/^[^a-z0-9]+/, "")
 		.slice(0, 48);
-	if (!NAME_PATTERN.test(name)) throw new Error(`"${raw}" can't be made into a peer name`);
+	if (!NAME_PATTERN.test(name)) throw new Error(`"${raw}" can't be used as a name`);
 	if (name === BROADCAST) throw new Error(`"${BROADCAST}" is reserved for broadcasts`);
 	return name;
 }
@@ -71,50 +93,83 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-export class Transport {
-	constructor(readonly root: string = defaultRoot()) {}
+function writeJson(file: string, value: unknown): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+	fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`);
+	fs.renameSync(temp, file);
+}
+
+function readJson<T>(file: string): T | undefined {
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function listDir(dir: string): string[] {
+	try {
+		return fs.readdirSync(dir).sort();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+}
+
+/** Swarms that currently have a phase, by name. */
+export function listSwarms(root = defaultRoot()): string[] {
+	return listDir(path.join(root, "swarms")).filter(name => fs.existsSync(path.join(root, "swarms", name, "phase.json")));
+}
+
+/** One swarm's mailboxes. Every method that acts for a member checks that its phase is current. */
+export class Swarm {
+	readonly dir: string;
+
+	constructor(
+		readonly name: string,
+		readonly root: string = defaultRoot(),
+	) {
+		this.dir = path.join(root, "swarms", normalizeName(name));
+	}
 
 	private path(...parts: string[]): string {
-		return path.join(this.root, ...parts);
+		return path.join(this.dir, ...parts);
 	}
 
-	private writeJson(file: string, value: unknown): void {
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-		fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`);
-		fs.renameSync(temp, file);
+	phase(): Phase | undefined {
+		return readJson<Phase>(this.path("phase.json"));
 	}
 
-	private readJson<T>(file: string): T | undefined {
-		try {
-			return JSON.parse(fs.readFileSync(file, "utf8")) as T;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-			throw error;
-		}
+	/** Delete the swarm's members and mail and begin a new phase. */
+	start(by: string): Phase {
+		fs.rmSync(this.dir, { recursive: true, force: true });
+		const phase: Phase = { id: randomUUID(), startedAt: Date.now(), startedBy: by };
+		writeJson(this.path("phase.json"), phase);
+		return phase;
 	}
 
-	private listJson(dir: string): string[] {
-		try {
-			return fs
-				.readdirSync(dir)
-				.filter(file => file.endsWith(".json"))
-				.sort();
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-			throw error;
-		}
+	/** The current phase, beginning one if the swarm has none yet. */
+	current(by: string): Phase {
+		return this.phase() ?? this.start(by);
+	}
+
+	private requireCurrent(phase: string): void {
+		if (this.phase()?.id !== phase) throw new StalePhaseError(this.name);
 	}
 
 	peer(name: string): Peer | undefined {
-		return this.readJson<Peer>(this.path("peers", `${name}.json`));
+		return readJson<Peer>(this.path("peers", `${name}.json`));
 	}
 
-	/** Every peer that has ever joined, by name. */
+	/** Members of the current phase. */
 	peers(): Peer[] {
-		return this.listJson(this.path("peers"))
-			.map(file => this.readJson<Peer>(this.path("peers", file)))
-			.filter((peer): peer is Peer => peer !== undefined);
+		const phase = this.phase()?.id;
+		return listDir(this.path("peers"))
+			.filter(file => file.endsWith(".json"))
+			.map(file => readJson<Peer>(this.path("peers", file)))
+			.filter((peer): peer is Peer => peer !== undefined && peer.phase === phase);
 	}
 
 	isOnline(peer: Peer, now = Date.now()): boolean {
@@ -123,50 +178,55 @@ export class Transport {
 	}
 
 	/**
-	 * Join as `desired`, or as `desired-2`, `-3`… when another live session holds it.
-	 * A name whose session has left is taken over, along with any mail waiting for it.
+	 * Join `phase` as `desired`, or as `desired-2`, `-3`… when another live member holds it.
+	 * A name whose member has left is taken over, along with any mail waiting for it.
 	 */
-	join(desired: string, cwd: string, pid = process.pid): Peer {
+	join(desired: string, phase: string, cwd: string, pid = process.pid): Peer {
+		this.requireCurrent(phase);
 		const base = normalizeName(desired);
 		for (let n = 1; ; n++) {
 			const name = n === 1 ? base : `${base}-${n}`;
 			const held = this.peer(name);
-			if (held && held.pid !== pid && this.isOnline(held)) continue;
+			if (held && held.phase === phase && held.pid !== pid && this.isOnline(held)) continue;
 			const now = Date.now();
-			const peer: Peer = { name, pid, host: os.hostname(), cwd, joinedAt: now, seenAt: now };
-			this.writeJson(this.path("peers", `${name}.json`), peer);
+			const peer: Peer = { name, phase, pid, host: os.hostname(), cwd, joinedAt: now, seenAt: now };
+			writeJson(this.path("peers", `${name}.json`), peer);
 			return peer;
 		}
 	}
 
-	/** Refresh `name`'s heartbeat; false when another session has since taken the name. */
-	heartbeat(name: string, pid = process.pid): boolean {
-		const peer = this.peer(name);
-		if (!peer || peer.pid !== pid) return false;
-		this.writeJson(this.path("peers", `${name}.json`), { ...peer, seenAt: Date.now() });
+	/** Refresh a member's heartbeat; false when another session has since taken its name. */
+	heartbeat(member: Peer): boolean {
+		this.requireCurrent(member.phase);
+		const peer = this.peer(member.name);
+		if (!peer || peer.pid !== member.pid || peer.phase !== member.phase) return false;
+		writeJson(this.path("peers", `${member.name}.json`), { ...peer, seenAt: Date.now() });
 		return true;
 	}
 
-	/** Mark `name` as gone, keeping its entry so mail can still be addressed to it. */
-	leave(name: string, pid = process.pid): void {
-		const peer = this.peer(name);
-		if (peer && peer.pid === pid) this.writeJson(this.path("peers", `${name}.json`), { ...peer, pid: null });
+	/** Mark a member as gone, keeping its entry so mail can still be addressed to it. */
+	leave(member: Peer): void {
+		const peer = this.peer(member.name);
+		if (peer && peer.pid === member.pid && peer.phase === member.phase && this.phase()?.id === member.phase) {
+			writeJson(this.path("peers", `${member.name}.json`), { ...peer, pid: null });
+		}
 	}
 
 	/**
-	 * Post `body` to `to`, a known peer or `all` (every known peer except the sender).
-	 * Offline peers keep their mail until they rejoin. Returns one message per recipient.
+	 * Post `body` from `from` to `to`, a member or `all` (every member except the sender).
+	 * Offline members keep their mail until they rejoin. Returns one message per recipient.
 	 */
-	send(from: string, to: string, body: string, replyTo?: string): Message[] {
+	send(from: string, phase: string, to: string, body: string, replyTo?: string): Message[] {
+		this.requireCurrent(phase);
 		if (!body.trim()) throw new Error("The message is empty.");
 		const known = this.peers().map(peer => peer.name);
 		let recipients: string[];
 		if (to === BROADCAST) {
 			recipients = known.filter(name => name !== from);
-			if (recipients.length === 0) throw new Error("No other peers have joined yet.");
+			if (recipients.length === 0) throw new Error(`No other members have joined swarm "${this.name}" yet.`);
 		} else {
 			if (!known.includes(to)) {
-				throw new Error(`No peer is called "${to}". Known peers: ${known.join(", ") || "none"}.`);
+				throw new Error(`Swarm "${this.name}" has no member "${to}". Members: ${known.join(", ") || "none"}.`);
 			}
 			recipients = [to];
 		}
@@ -174,49 +234,51 @@ export class Transport {
 		return recipients.map(recipient => {
 			// Time-first ids sort in sending order, which is the order they are delivered.
 			const id = `${sentAt.toString().padStart(13, "0")}-${randomUUID().slice(0, 8)}`;
-			const message: Message = { id, from, to: recipient, body, sentAt, ...(replyTo ? { replyTo } : {}) };
-			this.writeJson(this.path("inbox", recipient, `${id}.json`), message);
+			const message: Message = { id, phase, from, to: recipient, body, sentAt, ...(replyTo ? { replyTo } : {}) };
+			writeJson(this.path("inbox", recipient, `${id}.json`), message);
 			return message;
 		});
 	}
 
-	/** Take every message waiting for `name`, oldest first. Each is returned to one caller only. */
-	receive(name: string): Message[] {
+	/** Take every current-phase message waiting for `member`, oldest first; each goes to one caller only. */
+	receive(member: Peer): Message[] {
+		this.requireCurrent(member.phase);
 		const received: Message[] = [];
-		for (const file of this.listJson(this.path("inbox", name))) {
-			const delivered = this.path("delivered", name, file);
+		for (const file of listDir(this.path("inbox", member.name)).filter(file => file.endsWith(".json"))) {
+			const delivered = this.path("delivered", member.name, file);
 			fs.mkdirSync(path.dirname(delivered), { recursive: true });
 			try {
-				fs.renameSync(this.path("inbox", name, file), delivered);
+				fs.renameSync(this.path("inbox", member.name, file), delivered);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; // another poller took it
 				throw error;
 			}
-			const message = this.readJson<Message>(delivered);
-			if (message) received.push(message);
+			const message = readJson<Message>(delivered);
+			if (message && message.phase === member.phase) received.push(message);
 		}
 		return received;
 	}
 
 	/** Messages waiting for `name`, without taking them. */
 	pending(name: string): number {
-		return this.listJson(this.path("inbox", name)).length;
+		return listDir(this.path("inbox", name)).filter(file => file.endsWith(".json")).length;
 	}
 
-	/** The last `limit` messages `name` has received. */
+	/** The last `limit` messages `name` has received in this phase. */
 	history(name: string, limit = 20): Message[] {
-		return this.listJson(this.path("delivered", name))
+		return listDir(this.path("delivered", name))
+			.filter(file => file.endsWith(".json"))
 			.slice(-limit)
-			.map(file => this.readJson<Message>(this.path("delivered", name, file)))
+			.map(file => readJson<Message>(this.path("delivered", name, file)))
 			.filter((message): message is Message => message !== undefined);
 	}
 
-	/** Move mail still waiting for `from` to `to` (a session that renamed itself). */
+	/** Move mail still waiting for `from` to `to` (a member that renamed itself). */
 	moveInbox(from: string, to: string): void {
-		for (const file of this.listJson(this.path("inbox", from))) {
-			const message = this.readJson<Message>(this.path("inbox", from, file));
+		for (const file of listDir(this.path("inbox", from)).filter(file => file.endsWith(".json"))) {
+			const message = readJson<Message>(this.path("inbox", from, file));
 			if (!message) continue;
-			this.writeJson(this.path("inbox", to, file), { ...message, to });
+			writeJson(this.path("inbox", to, file), { ...message, to });
 			fs.rmSync(this.path("inbox", from, file), { force: true });
 		}
 	}
