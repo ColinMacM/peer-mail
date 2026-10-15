@@ -20,7 +20,9 @@ There is one swarm at a time. Roles go in the prompt:
 (terminal 3)  plain omp: isolated, can't see or be reached by the swarm
 ```
 
-Members get `peer_list`, `peer_send` and `peer_rename`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. A message shows up in the other member's conversation; if that session is idle it starts a turn, and if it's working it reads the message at its next step. Mail to a member that isn't running waits until a session rejoins under that name.
+Members get `peer_list`, `peer_send` and `peer_rename`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name.
+
+Mail interrupts its recipient. If the recipient is working, its turn is aborted along with the commands and eval it is running (the same as pressing Esc), and the mail starts a new turn once it has stopped; an idle recipient just starts a turn. Background jobs (`async` bash, background subagents) can't be cancelled from an extension, so the delivered mail lists any still running and tells the agent to stop them first with `write proc://<id>/kill`.
 
 `/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one.
 
@@ -66,6 +68,7 @@ Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the r
 - One machine: sessions on different machines don't see each other.
 - Inside the swarm every member can message every other; isolation is by not joining.
 - A message from another session is a request, not the user's instruction; the delivered text tells the agent so.
+- Background jobs are stopped by the agent following the instruction in the mail, not by the extension itself (omp gives extensions no way to cancel them).
 - `omp -p` runs have no slash commands, so they can't join.
 
 ## Development

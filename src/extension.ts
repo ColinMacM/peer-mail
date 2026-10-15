@@ -9,14 +9,14 @@
  *
  * `[label]` says what the run is for (default: the session's directory name). A session that
  * hasn't joined is isolated: it has no peer tools and no one can mail it. Members get
- * `peer_list`, `peer_send` and `peer_rename`; mail arrives in their conversation and starts a
- * turn if they are idle, or is read at their next step if they are working. Roles come from the
- * prompt, and an agent can rename itself after its role.
+ * `peer_list`, `peer_send` and `peer_rename`. Mail interrupts its recipient: a working agent's
+ * turn is aborted (with its running commands and eval), then the mail starts a new turn.
+ * Roles come from the prompt, and an agent can rename itself after its role.
  */
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { formatForAgent, Membership, POLL_MS } from "./inbox";
-import { BROADCAST, HEARTBEAT_MS, StalePhaseError, Swarm } from "./transport";
+import { BROADCAST, HEARTBEAT_MS, type Message, StalePhaseError, Swarm } from "./transport";
 
 const TOOLS = ["peer_list", "peer_send", "peer_rename"];
 const ISOLATED = "This session is isolated: it hasn't joined the swarm (/swarm or /startswarm).";
@@ -58,10 +58,38 @@ export default function peerMail(pi: ExtensionAPI) {
 		await setTools(false);
 	}
 
+	/**
+	 * Hand received mail to the agent and start a turn on it. `interrupted` says its previous work
+	 * was just aborted. Background jobs can't be cancelled from an extension, so any still
+	 * running are listed for the agent to kill first.
+	 */
+	function deliver(ctx: ExtensionContext, messages: Message[], interrupted: boolean) {
+		const notes: string[] = [];
+		if (interrupted) {
+			notes.push(
+				"Your previous work was stopped (the running turn, its commands and eval) by this mail. " +
+					"Don't go back to it unless this mail or the user asks you to.",
+			);
+		}
+		const jobs = ctx.getAsyncJobSnapshot()?.running ?? [];
+		if (jobs.length > 0) {
+			const list = jobs.map(job => `${job.id} (${job.label})`).join(", ");
+			notes.push(`Background jobs are still running: ${list}. Before anything else, stop each one with write proc://<id>/kill.`);
+		}
+		const content = [...messages.map(formatForAgent), ...notes].join("\n\n---\n\n");
+		pi.sendMessage(
+			{ customType: "peer-mail", content, display: true, details: messages, attribution: "agent" },
+			{ triggerTurn: true },
+		);
+	}
+
 	function startPolling(ctx: ExtensionContext, member: Membership) {
 		stopPolling();
 		const beatEvery = Math.round(HEARTBEAT_MS / POLL_MS);
 		let tick = 0;
+		// Mail held while an interrupted turn unwinds; delivered once the session is idle.
+		const held: Message[] = [];
+		let interrupting = false;
 		const timer = ctx.setInterval(() => {
 			try {
 				if (++tick % beatEvery === 0) {
@@ -71,12 +99,16 @@ export default function peerMail(pi: ExtensionAPI) {
 						ctx.ui.notify(`peer-mail: your name was taken while this session was away; you are now ${renamed}`, "warning");
 					}
 				}
-				for (const message of member.receive()) {
-					// "aside": read at the agent's next step if it is working, or start a turn if idle.
-					pi.sendMessage(
-						{ customType: "peer-mail", content: formatForAgent(message), display: true, details: message, attribution: "agent" },
-						{ deliverAs: "aside" },
-					);
+				held.push(...member.receive());
+				if (held.length === 0) return;
+				if (ctx.isIdle()) {
+					deliver(ctx, held.splice(0), interrupting);
+					interrupting = false;
+				} else if (!interrupting) {
+					// New mail stops the agent outright: the turn, its tool calls, bash and eval.
+					interrupting = true;
+					ctx.ui.notify(`peer-mail: mail from ${held.map(message => message.from).join(", ")}; stopping current work`, "info");
+					ctx.abort();
 				}
 			} catch (error) {
 				if (!(error instanceof StalePhaseError)) throw error;
@@ -165,8 +197,8 @@ export default function peerMail(pi: ExtensionAPI) {
 		name: "peer_send",
 		label: "Peer send",
 		description:
-			`Send a message to a swarm member by name (see peer_list), or to '${BROADCAST}'. It appears in that member's conversation and wakes it if idle; ` +
-			"a member that isn't running gets it when it rejoins. Write a self-contained request: the other agent can't see your conversation. " +
+			`Send a message to a swarm member by name (see peer_list), or to '${BROADCAST}'. It interrupts that member: whatever it is doing is stopped and it handles your message next. ` +
+			"A member that isn't running gets it when it rejoins. Write a self-contained request: the other agent can't see your conversation. " +
 			"Don't send acknowledgements or thanks.",
 		parameters: z.object({
 			to: z.string().describe(`Member name from peer_list, or '${BROADCAST}' for every member.`),
