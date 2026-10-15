@@ -8,23 +8,34 @@
  *   /peer-name [name]              show or change this session's name in the swarm
  *
  * `[label]` says what the run is for (default: the session's directory name). A session that
- * hasn't joined is isolated: it has no peer tools and no one can mail it. Members get
- * `peer_list`, `peer_send` and `peer_rename`. Mail interrupts its recipient: a working agent's
- * turn is aborted (with its running commands and eval), then the mail starts a new turn.
- * Roles come from the prompt, and an agent can rename itself after its role.
+ * hasn't joined is isolated: it has no peer tools and no one can mail it.
+ *
+ * The swarm is a graph. Sessions joined by hand (/startswarm, /swarm) are hubs; a hub's
+ * `peer_spawn` opens a kitty split running a new omp session that joins as one of its vertices.
+ * A vertex can message only its hub; a hub can message its vertices and the other hubs. Members
+ * get `peer_list`, `peer_send` and `peer_rename` (hubs also `peer_spawn`). Mail interrupts its
+ * recipient: a working agent's turn is aborted (with its running commands and eval), then the
+ * mail starts a new turn. Roles come from the prompt, and an agent can rename itself after its role.
  */
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { formatForAgent, Membership, POLL_MS } from "./inbox";
+import { openSplit, type SplitDirection, splitUnavailable } from "./kitty";
 import { BROADCAST, HEARTBEAT_MS, type Message, StalePhaseError, Swarm } from "./transport";
 
-const TOOLS = ["peer_list", "peer_send", "peer_rename"];
+// Every member gets these; only hubs also get peer_spawn.
+const MEMBER_TOOLS = ["peer_list", "peer_send", "peer_rename"];
+const ALL_TOOLS = [...MEMBER_TOOLS, "peer_spawn"];
 const ISOLATED = "This session is isolated: it hasn't joined the swarm (/swarm or /startswarm).";
 const DEFAULT_NAME = "agent";
+/** How long peer_spawn waits for the new session to join before reporting it as still starting. */
+const SPAWN_JOIN_TIMEOUT_MS = 45_000;
 
 // Subagent sessions rebind this factory but share the module, so they act as their main session.
 let membership: Membership | undefined;
 let poller: { ctx: ExtensionContext; timer: Timer } | undefined;
+// A spawned session's request is taken once per process, on its first session start.
+let spawnHandled = false;
 
 /** `[label] rest` → label and rest; without brackets the whole text is the prompt. */
 function parseStartArgs(args: string): { label?: string; prompt: string } {
@@ -36,9 +47,11 @@ export default function peerMail(pi: ExtensionAPI) {
 	const z = pi.zod;
 	const swarm = new Swarm();
 
-	async function setTools(active: boolean) {
-		const others = pi.getActiveTools().filter(name => !TOOLS.includes(name));
-		await pi.setActiveTools(active ? [...others, ...TOOLS] : others);
+	/** Activate the peer tools this member's place allows (none when isolated). */
+	async function setTools(member: Membership | undefined) {
+		const others = pi.getActiveTools().filter(name => !ALL_TOOLS.includes(name));
+		const mine = !member ? [] : member.hub === null ? ALL_TOOLS : MEMBER_TOOLS;
+		await pi.setActiveTools([...others, ...mine]);
 	}
 
 	function showStatus(ctx: ExtensionContext) {
@@ -55,7 +68,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		stopPolling();
 		membership = undefined;
 		showStatus(ctx);
-		await setTools(false);
+		await setTools(undefined);
 	}
 
 	/**
@@ -136,24 +149,22 @@ export default function peerMail(pi: ExtensionAPI) {
 					? Membership.attach(swarm, desired, ctx.cwd)
 					: Membership.start(swarm, label, desired, ctx.cwd);
 			membership = member;
-			await setTools(true);
+			await setTools(member);
 			startPolling(ctx, member);
 			showStatus(ctx);
 
 			const runLabel = swarm.phase()?.label ?? "swarm";
-			const others = swarm
-				.peers()
-				.filter(peer => peer.name !== member.name)
-				.map(peer => peer.name);
+			const others = swarm.reachable(member.name).map(peer => peer.name);
 			const verb = label === undefined ? "joined" : "started";
 			ctx.ui.notify(`peer-mail: ${verb} swarm ${runLabel} as ${member.name}`, "info");
 			pi.sendMessage(
 				{
 					customType: "peer-mail",
 					content:
-						`You ${verb} the swarm "${runLabel}" as "${member.name}". Other members: ${others.join(", ") || "none yet"}. ` +
+						`You ${verb} the swarm "${runLabel}" as "${member.name}", a hub. Members you can message: ${others.join(", ") || "none yet"}. ` +
 						"If your task gives you a role, first rename yourself after it with peer_rename (for example 'reviewer') so the others can address you. " +
-						"Use peer_list to see who is in the swarm and peer_send to message them; their messages arrive in this conversation. " +
+						"Use peer_spawn to start another agent in a new terminal split: it works on the prompt you give it and can only message you. " +
+						"Use peer_list to see who you can reach and peer_send to message them; their messages arrive in this conversation. " +
 						"Sessions outside the swarm can't reach you, and you can't reach them.",
 					display: true,
 					attribution: "agent",
@@ -166,6 +177,40 @@ export default function peerMail(pi: ExtensionAPI) {
 		}
 	}
 
+	/** A session peer_spawn launched (PEER_MAIL_SPAWN is set): join as that vertex and start on its prompt. */
+	pi.on("session_start", async (_event, ctx) => {
+		const id = process.env.PEER_MAIL_SPAWN;
+		if (!id || spawnHandled || ctx.agent.kind !== "main" || (ctx.mode !== "tui" && ctx.mode !== "rpc")) return;
+		spawnHandled = true;
+		try {
+			const request = swarm.takeSpawn(id);
+			if (!request || request.phase !== swarm.phase()?.id) {
+				ctx.ui.notify("peer-mail: the swarm this session was started for has been restarted; staying isolated.", "warning");
+				return;
+			}
+			const member = Membership.spawned(swarm, request, ctx.cwd);
+			membership = member;
+			await setTools(member);
+			startPolling(ctx, member);
+			showStatus(ctx);
+			pi.sendMessage(
+				{
+					customType: "peer-mail",
+					content:
+						`You were started by "${request.hub}" in the swarm "${swarm.phase()?.label ?? "swarm"}" as "${member.name}". ` +
+						`You can only message ${request.hub}, with peer_send; its messages arrive in this conversation. ` +
+						`When you finish, or need something, tell ${request.hub}: it is waiting on you.`,
+					display: true,
+					attribution: "agent",
+				},
+				{ deliverAs: "nextTurn" },
+			);
+			pi.sendUserMessage(request.prompt);
+		} catch (error) {
+			ctx.ui.notify(`peer-mail: couldn't join as a spawned agent: ${(error as Error).message}`, "error");
+		}
+	});
+
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.agent.kind !== "main" || !membership) return;
 		membership.leave();
@@ -177,7 +222,8 @@ export default function peerMail(pi: ExtensionAPI) {
 		name: "peer_list",
 		label: "Peer list",
 		description:
-			"List the swarm members you can message with peer_send: their name, whether they are running now, and their working directory. Also says your own name.",
+			"List the swarm members you can message with peer_send (a spawned agent reaches only its hub; a hub reaches its own agents and other hubs): " +
+			"their name, whether they are running now, their hub, and their working directory. Also says your own name and hub.",
 		parameters: z.object({}),
 		approval: "read",
 		defaultInactive: true,
@@ -185,10 +231,9 @@ export default function peerMail(pi: ExtensionAPI) {
 			if (!membership) throw new Error(ISOLATED);
 			const you = membership.name;
 			const peers = swarm
-				.peers()
-				.filter(peer => peer.name !== you)
-				.map(peer => ({ name: peer.name, online: swarm.isOnline(peer), cwd: peer.cwd }));
-			const details = { swarm: swarm.phase()?.label, you, peers };
+				.reachable(you)
+				.map(peer => ({ name: peer.name, online: swarm.isOnline(peer), hub: peer.hub, cwd: peer.cwd }));
+			const details = { swarm: swarm.phase()?.label, you, hub: membership.hub, peers };
 			return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
 		},
 	});
@@ -237,6 +282,56 @@ export default function peerMail(pi: ExtensionAPI) {
 			const name = membership.rename(params.name);
 			showStatus(ctx);
 			return { content: [{ type: "text", text: `You are now "${name}" (was "${previous}").` }], details: { name, previous } };
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_spawn",
+		label: "Peer spawn",
+		description:
+			"Start another agent: a new omp session in a kitty split beside this one, working on `prompt`. It joins the swarm as one of your vertices: " +
+			"it can only message you (with peer_send), and its messages arrive in your conversation. Give it a role name and a self-contained prompt " +
+			"(it can't see your conversation), including what to report back to you and when. Only hubs can spawn. Waits until the agent has joined.",
+		parameters: z.object({
+			name: z.string().describe("Its name in the swarm, usually its role, e.g. 'reviewer'."),
+			prompt: z.string().describe("Its task, written for an agent that can't see your conversation."),
+			split: z.enum(["auto", "vertical", "horizontal"]).optional().describe("How to split this window (default auto)."),
+		}),
+		approval: "exec",
+		defaultInactive: true,
+		async execute(
+			_toolCallId,
+			params: { name: string; prompt: string; split?: SplitDirection },
+			signal,
+			_onUpdate,
+			ctx,
+		) {
+			if (!membership) throw new Error(ISOLATED);
+			const hub = membership.hub;
+			if (hub !== null) throw new Error(`Only hubs can spawn agents; you are an agent of ${hub}.`);
+			const unavailable = splitUnavailable();
+			if (unavailable) throw new Error(unavailable);
+			const request = swarm.requestSpawn(membership.peer, params.name, params.prompt);
+			const env: Record<string, string> = { PEER_MAIL_SPAWN: request.id, PATH: process.env.PATH ?? "" };
+			if (process.env.PEER_MAIL_DIR) env.PEER_MAIL_DIR = process.env.PEER_MAIL_DIR;
+			const window = await openSplit({
+				command: [Bun.which("omp") ?? "omp"],
+				cwd: ctx.cwd,
+				title: `omp · ${params.name}`,
+				env,
+				direction: params.split ?? "auto",
+			});
+			const deadline = Date.now() + SPAWN_JOIN_TIMEOUT_MS;
+			while (Date.now() < deadline && !signal?.aborted) {
+				const joined = swarm.spawned(request.id);
+				if (joined) {
+					const text = `Started "${joined.name}" in kitty window ${window}. It is working on your prompt and will message you.`;
+					return { content: [{ type: "text", text }], details: { name: joined.name, window } };
+				}
+				await Bun.sleep(500);
+			}
+			const text = `Opened kitty window ${window}, but the agent hasn't joined the swarm yet; check it with peer_list shortly.`;
+			return { content: [{ type: "text", text }], details: { name: params.name, window } };
 		},
 	});
 

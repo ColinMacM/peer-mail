@@ -3,9 +3,13 @@
  * session is isolated.
  *
  *   <root>/swarm/phase.json                   the current phase: its label, who started it, when
- *   <root>/swarm/peers/<name>.json            a member: pid, cwd, phase, last heartbeat
+ *   <root>/swarm/peers/<name>.json            a member: pid, cwd, phase, hub, last heartbeat
  *   <root>/swarm/inbox/<name>/<id>.json       mail waiting for <name>
  *   <root>/swarm/delivered/<name>/<id>.json   mail <name> has received (its history)
+ *   <root>/swarm/spawns/<id>.json             a hub's request for a new vertex, until it starts
+ *
+ * Members form a graph: hubs (joined by hand) and vertices (spawned by a hub). A vertex can
+ * message only its hub; a hub can message its vertices and the other hubs.
  *
  * `/startswarm` begins a new phase: the directory is deleted and recreated, so earlier members
  * and their mail are gone. A session still holding the old phase id is stale: its heartbeat,
@@ -38,6 +42,29 @@ export interface Peer {
 	cwd: string;
 	joinedAt: number;
 	seenAt: number;
+	/**
+	 * The member that spawned this one, or null for a hub (a session someone started and joined
+	 * by hand). A vertex can only message its hub; a hub can message its vertices and other hubs.
+	 */
+	hub: string | null;
+	/** The spawn request this member was started for, if it was spawned. */
+	spawn?: string;
+}
+
+/** A hub's request for a new vertex, read by the session the hub launches. */
+export interface SpawnRequest {
+	id: string;
+	phase: string;
+	hub: string;
+	name: string;
+	prompt: string;
+	createdAt: number;
+}
+
+export interface JoinOptions {
+	pid?: number;
+	hub?: string | null;
+	spawn?: string;
 }
 
 export interface Message {
@@ -60,6 +87,8 @@ export const HUMAN = "human";
 export const BROADCAST = "all";
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/;
+// Orders messages one process sends within the same millisecond.
+let sendCounter = 0;
 
 /** Raised when a session acts on a phase that `/startswarm` has since replaced. */
 export class StalePhaseError extends Error {
@@ -170,18 +199,70 @@ export class Swarm {
 	 * Join `phase` as `desired`, or as `desired-2`, `-3`… when another live member holds it.
 	 * A name whose member has left is taken over, along with any mail waiting for it.
 	 */
-	join(desired: string, phase: string, cwd: string, pid = process.pid): Peer {
+	join(desired: string, phase: string, cwd: string, options: JoinOptions = {}): Peer {
 		this.requireCurrent(phase);
+		const pid = options.pid ?? process.pid;
 		const base = normalizeName(desired);
 		for (let n = 1; ; n++) {
 			const name = n === 1 ? base : `${base}-${n}`;
 			const held = this.peer(name);
 			if (held && held.phase === phase && held.pid !== pid && this.isOnline(held)) continue;
 			const now = Date.now();
-			const peer: Peer = { name, phase, pid, host: os.hostname(), cwd, joinedAt: now, seenAt: now };
+			const peer: Peer = {
+				name,
+				phase,
+				pid,
+				host: os.hostname(),
+				cwd,
+				joinedAt: now,
+				seenAt: now,
+				hub: options.hub ?? null,
+				...(options.spawn ? { spawn: options.spawn } : {}),
+			};
 			writeJson(this.path("peers", `${name}.json`), peer);
 			return peer;
 		}
+	}
+
+	/**
+	 * The members `from` may message. A vertex reaches only its hub; a hub reaches its own
+	 * vertices and the other hubs. Mail from the command line (`human`) reaches everyone.
+	 */
+	reachable(from: string): Peer[] {
+		const peers = this.peers().filter(peer => peer.name !== from);
+		if (from === HUMAN) return peers;
+		const sender = this.peer(from);
+		if (!sender) return [];
+		if (sender.hub !== null) return peers.filter(peer => peer.name === sender.hub);
+		return peers.filter(peer => peer.hub === null || peer.hub === sender.name);
+	}
+
+	/** Point the vertices of a hub that renamed itself at its new name. */
+	reassignHub(from: string, to: string): void {
+		for (const peer of this.peers().filter(peer => peer.hub === from)) {
+			writeJson(this.path("peers", `${peer.name}.json`), { ...peer, hub: to });
+		}
+	}
+
+	/** Record a hub's request for a new vertex; the launched session finds it by id. */
+	requestSpawn(hub: Peer, name: string, prompt: string): SpawnRequest {
+		this.requireCurrent(hub.phase);
+		const request: SpawnRequest = { id: randomUUID(), phase: hub.phase, hub: hub.name, name, prompt, createdAt: Date.now() };
+		writeJson(this.path("spawns", `${request.id}.json`), request);
+		return request;
+	}
+
+	/** Take a spawn request (it is used once). Undefined when it is gone, e.g. after /startswarm. */
+	takeSpawn(id: string): SpawnRequest | undefined {
+		const file = this.path("spawns", `${id}.json`);
+		const request = readJson<SpawnRequest>(file);
+		fs.rmSync(file, { force: true });
+		return request;
+	}
+
+	/** The member that joined for spawn request `id`, once it has. */
+	spawned(id: string): Peer | undefined {
+		return this.peers().find(peer => peer.spawn === id);
 	}
 
 	/** Refresh a member's heartbeat; false when another session has since taken its name. */
@@ -216,21 +297,24 @@ export class Swarm {
 	send(from: string, phase: string, to: string, body: string, replyTo?: string): Message[] {
 		this.requireCurrent(phase);
 		if (!body.trim()) throw new Error("The message is empty.");
-		const known = this.peers().map(peer => peer.name);
+		const reachable = this.reachable(from).map(peer => peer.name);
 		let recipients: string[];
 		if (to === BROADCAST) {
-			recipients = known.filter(name => name !== from);
-			if (recipients.length === 0) throw new Error("No other members have joined the swarm yet.");
+			recipients = reachable;
+			if (recipients.length === 0) throw new Error("No member you can message has joined yet.");
 		} else {
-			if (!known.includes(to)) {
-				throw new Error(`The swarm has no member "${to}". Members: ${known.join(", ") || "none"}.`);
+			if (!reachable.includes(to)) {
+				const why = this.peer(to)?.phase === phase ? "you can't message it" : "the swarm has no such member";
+				throw new Error(`Can't send to "${to}": ${why}. You can message: ${reachable.join(", ") || "nobody yet"}.`);
 			}
 			recipients = [to];
 		}
 		const sentAt = Date.now();
 		return recipients.map(recipient => {
-			// Time-first ids sort in sending order, which is the order they are delivered.
-			const id = `${sentAt.toString().padStart(13, "0")}-${randomUUID().slice(0, 8)}`;
+			// Ids sort in sending order, which is the order they are delivered: time first, then this
+			// process's counter for sends within the same millisecond.
+			sendCounter += 1;
+			const id = `${sentAt.toString().padStart(13, "0")}-${sendCounter.toString().padStart(9, "0")}-${randomUUID().slice(0, 8)}`;
 			const message: Message = { id, phase, from, to: recipient, body, sentAt, ...(replyTo ? { replyTo } : {}) };
 			writeJson(this.path("inbox", recipient, `${id}.json`), message);
 			return message;

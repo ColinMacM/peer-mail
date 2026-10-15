@@ -38,12 +38,12 @@ test("/swarm with nothing running is refused rather than starting a swarm", () =
 
 test("only members can be addressed", () => {
 	const programmer = Membership.start(swarm, "s", "programmer", "/r");
-	expect(() => programmer.send("loner", "hi")).toThrow(/no member "loner". Members: programmer/);
+	expect(() => programmer.send("loner", "hi")).toThrow(/Can't send to "loner": the swarm has no such member/);
 });
 
 test("/startswarm ends the previous phase: old members go stale and their mail is gone", () => {
 	const old = Membership.start(swarm, "first run", "programmer", "/r");
-	swarm.join("reviewer", old.peer.phase, "/x", deadPid());
+	swarm.join("reviewer", old.peer.phase, "/x", { pid: deadPid() });
 	old.send("reviewer", "from the old run");
 
 	const fresh = Membership.start(new Swarm(root), "second run", "lead", "/r");
@@ -71,12 +71,12 @@ test("a name held by a running session gets a suffix; a dead session's name is t
 	const phase = swarm.start("s", "test").id;
 	const holder = Bun.spawn(["sleep", "30"]);
 	try {
-		swarm.join("agent", phase, "/r", holder.pid);
+		swarm.join("agent", phase, "/r", { pid: holder.pid });
 		expect(swarm.join("agent", phase, "/r").name).toBe("agent-2");
 	} finally {
 		holder.kill();
 	}
-	swarm.join("other", phase, "/o", deadPid());
+	swarm.join("other", phase, "/o", { pid: deadPid() });
 	expect(swarm.join("other", phase, "/o").name).toBe("other");
 });
 
@@ -99,5 +99,51 @@ test("renaming to a role brings waiting mail along and frees the old name", () =
 	ada.send("reviewer-bot", "for the new name");
 	expect(session.receive().map(message => message.body)).toEqual(["for the new name"]);
 	expect(swarm.peers().map(peer => peer.name).sort()).toEqual(["ada", "reviewer-bot"]);
-	expect(() => ada.send("agent", "to the old name")).toThrow(/no member "agent"/);
+	expect(() => ada.send("agent", "to the old name")).toThrow(/Can't send to "agent": the swarm has no such member/);
+});
+
+test("a vertex reaches only its hub; a hub reaches its vertices and other hubs, not their vertices", () => {
+	const lead = Membership.start(swarm, "s", "lead", "/r");
+	const other = Membership.attach(swarm, "other", "/o");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test"), "/r");
+	const helper = Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help"), "/o");
+
+	const names = (member: Membership) => swarm.reachable(member.name).map(peer => peer.name).sort();
+	expect(names(reviewer)).toEqual(["lead"]);
+	expect(names(lead)).toEqual(["other", "reviewer", "tester"]);
+	expect(names(other)).toEqual(["helper", "lead"]);
+	expect(() => reviewer.send("tester", "hi")).toThrow(/Can't send to "tester": you can't message it. You can message: lead/);
+	expect(() => lead.send("helper", "hi")).toThrow(/you can't message it/);
+	expect(reviewer.send("all", "done").map(message => message.to)).toEqual(["lead"]);
+	expect(helper.hub).toBe("other");
+});
+
+test("a spawn request is used once and finds the member that joined for it", () => {
+	const lead = Membership.start(swarm, "s", "lead", "/r");
+	const request = swarm.requestSpawn(lead.peer, "reviewer", "review the diff");
+	expect(swarm.spawned(request.id)).toBeUndefined();
+
+	const taken = swarm.takeSpawn(request.id)!;
+	expect(taken.prompt).toBe("review the diff");
+	expect(swarm.takeSpawn(request.id)).toBeUndefined();
+	const vertex = Membership.spawned(swarm, taken, "/r");
+	expect(swarm.spawned(request.id)?.name).toBe(vertex.name);
+});
+
+test("/startswarm throws away spawn requests that haven't been taken", () => {
+	const lead = Membership.start(swarm, "first", "lead", "/r");
+	const request = swarm.requestSpawn(lead.peer, "reviewer", "review");
+	Membership.start(new Swarm(root), "second", "lead", "/r");
+	expect(swarm.takeSpawn(request.id)).toBeUndefined();
+});
+
+test("a hub that renames itself keeps its vertices", () => {
+	const lead = Membership.start(swarm, "s", "agent", "/r");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+
+	lead.rename("lead");
+	expect(reviewer.hub).toBe("lead");
+	expect(reviewer.send("lead", "done").map(message => message.to)).toEqual(["lead"]);
+	expect(swarm.reachable("lead").map(peer => peer.name)).toEqual(["reviewer"]);
 });

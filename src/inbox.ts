@@ -1,7 +1,7 @@
 /**
  * One session's membership of a swarm: its name, its heartbeat, and its incoming mail.
  */
-import { type Message, type Peer, Swarm } from "./transport";
+import { type JoinOptions, type Message, type Peer, type SpawnRequest, Swarm } from "./transport";
 
 /** How often a member checks its inbox. */
 export const POLL_MS = 1_000;
@@ -29,12 +29,28 @@ export class Membership {
 		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd));
 	}
 
+	/** A session a hub launched with peer_spawn: join as the vertex its request names. */
+	static spawned(swarm: Swarm, request: SpawnRequest, cwd: string): Membership {
+		return new Membership(swarm, swarm.join(request.name, request.phase, cwd, { hub: request.hub, spawn: request.id }));
+	}
+
 	get name(): string {
 		return this.#peer.name;
 	}
 
 	get peer(): Peer {
 		return this.#peer;
+	}
+
+	/** The hub this member reports to, or null when it is a hub itself. Read fresh: hubs can rename. */
+	get hub(): string | null {
+		const current = this.swarm.peer(this.name);
+		return current && current.pid === this.#peer.pid ? current.hub : this.#peer.hub;
+	}
+
+	/** The join options that keep this member's place in the graph when it joins again. */
+	#placement(): JoinOptions {
+		return { hub: this.hub, ...(this.#peer.spawn ? { spawn: this.#peer.spawn } : {}) };
 	}
 
 	/**
@@ -44,17 +60,18 @@ export class Membership {
 	 */
 	heartbeat(): string | undefined {
 		if (this.swarm.heartbeat(this.#peer)) return undefined;
-		this.#peer = this.swarm.join(this.name, this.#peer.phase, this.#peer.cwd);
+		this.#peer = this.swarm.join(this.name, this.#peer.phase, this.#peer.cwd, this.#placement());
 		return this.name;
 	}
 
-	/** Switch to `desiredName`, bringing along mail that was still waiting. Returns the name taken. */
+	/** Switch to `desiredName`, bringing along mail that was still waiting and any vertices. Returns the name taken. */
 	rename(desiredName: string): string {
 		const previous = this.#peer;
-		this.#peer = this.swarm.join(desiredName, previous.phase, previous.cwd);
+		this.#peer = this.swarm.join(desiredName, previous.phase, previous.cwd, this.#placement());
 		if (this.name !== previous.name) {
 			this.swarm.moveInbox(previous.name, this.name);
 			this.swarm.forget(previous);
+			this.swarm.reassignHub(previous.name, this.name);
 		}
 		return this.name;
 	}
