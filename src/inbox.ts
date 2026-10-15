@@ -2,7 +2,8 @@
  * One session's membership of a swarm: its name, its heartbeat, and its incoming mail.
  */
 import { currentKittyWindow } from "./kitty";
-import { type Activity, type JoinOptions, type Message, type Peer, type SpawnRequest, Swarm } from "./transport";
+import { type Activity, type JoinOptions, type Message, type Peer, type SendOptions, type SpawnRequest, Swarm } from "./transport";
+import { LOADED_VERSION } from "./version";
 
 /** How often a member checks its inbox. */
 export const POLL_MS = 1_000;
@@ -20,19 +21,19 @@ export class Membership {
 	/** `/startswarm`: delete the swarm's members and mail, begin a new phase labelled `label`, and join it. */
 	static start(swarm: Swarm, label: string, desiredName: string, cwd: string, model?: string): Membership {
 		const phase = swarm.start(label, `${desiredName} (pid ${process.pid})`);
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow(), model }));
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow(), model, plugin: LOADED_VERSION }));
 	}
 
 	/** `/swarm`: join the swarm as it is now. Fails when no swarm has been started. */
 	static attach(swarm: Swarm, desiredName: string, cwd: string, model?: string): Membership {
 		const phase = swarm.phase();
 		if (!phase) throw new Error("No swarm is running. Start one with /startswarm.");
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow(), model }));
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow(), model, plugin: LOADED_VERSION }));
 	}
 
 	/** A session a hub launched with peer_spawn: join as the vertex its request names. */
 	static spawned(swarm: Swarm, request: SpawnRequest, cwd: string, model?: string): Membership {
-		const placement = { hub: request.hub, spawn: request.id, kitty: currentKittyWindow(), model };
+		const placement = { hub: request.hub, spawn: request.id, kitty: currentKittyWindow(), model, plugin: LOADED_VERSION };
 		return new Membership(swarm, swarm.join(request.name, request.phase, cwd, placement));
 	}
 
@@ -53,7 +54,7 @@ export class Membership {
 	/** The join options that keep this member's place in the graph when it joins again. */
 	#placement(): JoinOptions {
 		const { kitty, model, spawn } = this.#peer;
-		return { hub: this.hub, kitty, model, ...(spawn ? { spawn } : {}) };
+		return { hub: this.hub, kitty, model, plugin: LOADED_VERSION, ...(spawn ? { spawn } : {}) };
 	}
 
 	/**
@@ -81,12 +82,19 @@ export class Membership {
 		return this.name;
 	}
 
+	/** Take waiting mail. Mail means more work, so a member that had finished no longer is. */
 	receive(): Message[] {
-		return this.swarm.receive(this.#peer);
+		const messages = this.swarm.receive(this.#peer);
+		if (messages.length > 0 && this.swarm.peer(this.name)?.finished) this.swarm.setStatus(this.#peer, { finished: false });
+		return messages;
 	}
 
-	send(to: string, body: string, replyTo?: string): Message[] {
-		return this.swarm.send(this.name, this.#peer.phase, to, body, replyTo);
+	send(to: string, body: string, options?: SendOptions): Message[] {
+		return this.swarm.send(this.name, this.#peer.phase, to, body, options);
+	}
+
+	setStatus(update: { status?: string; finished?: boolean }): void {
+		this.swarm.setStatus(this.#peer, update);
 	}
 
 	leave(): void {
@@ -99,6 +107,6 @@ export class Membership {
  * body. The briefing a member gets on joining explains the header once, so each message is short.
  */
 export function formatForAgent(message: Message): string {
-	const header = { from: message.from, id: message.id, ...(message.replyTo ? { re: message.replyTo } : {}) };
+	const header = { from: message.from, id: message.id, ...(message.replyTo ? { re: message.replyTo } : {}), ...(message.user ? { user: message.user } : {}) };
 	return `${JSON.stringify(header)}\n${message.body}`;
 }

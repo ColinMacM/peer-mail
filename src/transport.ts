@@ -57,6 +57,12 @@ export interface Peer {
 	activity?: Activity;
 	/** When the member's session ended (it left or exited); unset while it runs or if it crashed. */
 	leftAt?: number;
+	/** A short status the member set itself with peer_status. */
+	status?: string;
+	/** Set by the member when its work is done; broadcasts skip it, and mail to it clears it. */
+	finished?: boolean;
+	/** Which peer-mail code the member's session loaded (see version.ts). */
+	plugin?: string;
 }
 
 /** What a member is doing: thinking, running a tool (the latest one it started), or idle. */
@@ -91,6 +97,14 @@ export interface JoinOptions {
 	spawn?: string;
 	kitty?: KittyWindow;
 	model?: string;
+	plugin?: string;
+}
+
+export interface SendOptions {
+	/** Id of the message this answers. */
+	replyTo?: string;
+	/** The user's own words, verified by the sender's extension against its session (see quote.ts). */
+	user?: string;
 }
 
 export interface Message {
@@ -101,6 +115,8 @@ export interface Message {
 	body: string;
 	sentAt: number;
 	replyTo?: string;
+	/** The user's own words, quoted verbatim from the sender's session. */
+	user?: string;
 }
 
 /** How often a member refreshes its peers/ entry. */
@@ -246,6 +262,7 @@ export class Swarm {
 				...(options.spawn ? { spawn: options.spawn } : {}),
 				...(options.kitty ? { kitty: options.kitty } : {}),
 				...(options.model ? { model: options.model } : {}),
+				...(options.plugin ? { plugin: options.plugin } : {}),
 			};
 			writeJson(this.path("peers", `${name}.json`), peer);
 			return peer;
@@ -310,6 +327,14 @@ export class Swarm {
 		}
 	}
 
+	/** Record a member's own status and whether its work is finished. */
+	setStatus(member: Peer, update: { status?: string; finished?: boolean }): void {
+		this.requireCurrent(member.phase);
+		const peer = this.peer(member.name);
+		if (!peer || peer.pid !== member.pid) return;
+		writeJson(this.path("peers", `${member.name}.json`), { ...peer, ...update });
+	}
+
 	/** Remove a member's entry entirely (it renamed itself), so no one mails the old name. */
 	forget(member: Peer): void {
 		const peer = this.peer(member.name);
@@ -319,19 +344,19 @@ export class Swarm {
 	}
 
 	/**
-	 * Post `body` from `from` to `to`: a member, or `all` (every running member it can reach).
+	 * Post `body` from `from` to `to`: a member, or `all` (every running, unfinished member it can reach).
 	 * An offline member keeps its mail until it rejoins. Returns one message per recipient.
 	 */
-	send(from: string, phase: string, to: string, body: string, replyTo?: string): Message[] {
+	send(from: string, phase: string, to: string, body: string, options: SendOptions = {}): Message[] {
 		this.requireCurrent(phase);
 		if (!body.trim()) throw new Error("The message is empty.");
 		const reachable = this.reachable(from).map(peer => peer.name);
 		let recipients: string[];
 		if (to === BROADCAST) {
 			recipients = this.reachable(from)
-				.filter(peer => this.isOnline(peer))
+				.filter(peer => this.isOnline(peer) && !peer.finished)
 				.map(peer => peer.name);
-			if (recipients.length === 0) throw new Error("No member you can message is running.");
+			if (recipients.length === 0) throw new Error("No member you can message is running and unfinished.");
 		} else {
 			if (!reachable.includes(to)) {
 				const why = this.peer(to)?.phase === phase ? "you can't message it" : "the swarm has no such member";
@@ -345,7 +370,7 @@ export class Swarm {
 			// process's counter for sends within the same millisecond. Short, since agents quote them.
 			sendCounter += 1;
 			const id = `${sentAt.toString(36).padStart(9, "0")}-${sendCounter.toString(36).padStart(4, "0")}-${randomUUID().slice(0, 4)}`;
-			const message: Message = { id, phase, from, to: recipient, body, sentAt, ...(replyTo ? { replyTo } : {}) };
+			const message: Message = { id, phase, from, to: recipient, body, sentAt, ...(options.replyTo ? { replyTo: options.replyTo } : {}), ...(options.user ? { user: options.user } : {}) };
 			writeJson(this.path("inbox", recipient, `${id}.json`), message);
 			return message;
 		});

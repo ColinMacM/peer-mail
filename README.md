@@ -21,7 +21,7 @@ There is one swarm at a time. Roles go in the prompt:
 (terminal 3)  plain omp: isolated, can't see or be reached by the swarm
 ```
 
-Members get `peer_list`, `peer_send` and `peer_rename`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members.
+Members get `peer_list`, `peer_send`, `peer_rename` and `peer_status`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members that aren't finished.
 
 How mail lands depends on who receives it:
 
@@ -35,9 +35,13 @@ Mail reaches the agent as one JSON line and the body:
 Run the tests on build-2 and tell me what fails.
 ```
 
-The briefing a member gets on joining explains this once: `re` is the message being answered, and mail comes from an agent, so it's a request, not the user's instruction or approval.
+The briefing a member gets on joining explains this once: `re` is the message being answered, and mail comes from an agent, so it's a request, not the user's instruction or approval. How to write mail is said once, in `peer_send`'s description: caveman-terse (facts, paths, numbers, commands; no filler), and confirm every message received with a terse reply saying what was understood and will be done, but never confirm a confirmation.
 
-A hub hears when one of its agents goes offline: `{"offline":"tester","why":"exited","last":"running bash: Run tests","unread":0}` (`why` is `stopped responding (crashed or killed)` when it died without leaving). `peer_list` shows each member's state without interrupting it: `thinking 12s`, `running bash: Run tests 3m`, `idle 40s`, or `offline 5m (exited)`.
+**Relaying your words.** When an agent needs your instruction or approval, the hub passes it on with `peer_send`'s `user_quote`: your exact words, copied from a message you sent it or an answer you gave in a question box. peer-mail checks the quote against the sender's own session and refuses it unless you really said it there. Messages you typed count, as do question-box answers; prompts a hub wrote for a spawned agent, tool output and the agent's own text don't. The recipient gets it as `"user":"…"` in the header and is told it's your instruction.
+
+**Status and finished.** `peer_status` lets an agent post a few words about what it's on, and mark itself finished, without messaging anyone. `peer_list` shows it, and broadcasts skip finished agents. Mail sent to a finished agent by name makes it unfinished again.
+
+A hub hears when one of its agents goes offline: `{"offline":"tester","why":"exited","last":"running bash: Run tests","unread":0}` (`why` is `stopped responding (crashed or killed)` when it died without leaving). `peer_list` shows each member's state without interrupting it: `thinking 12s`, `running bash: Run tests 3m`, `idle 40s`, or `offline 5m (exited)`. It also marks `oldPlugin` for a member running older peer-mail code than is on disk: each session records a hash of the plugin's source when it loads (`src/version.ts`), and only a restart picks up new code. `bun src/cli.ts list` shows the same as `OLD CODE (restart)`.
 
 `/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one.
 
@@ -134,6 +138,8 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 | `src/models.ts` | your omp roles, subscription usage, and which model a new agent gets |
 | `src/sandbox.ts` | the sandbox profile spawned agents' commands run in |
 | `src/queue.ts` | the run queue: waiting in line, running in the sandbox, killing what a run leaves behind |
+| `src/quote.ts` | checking that a quote is the user's own words before it is relayed |
+| `src/version.ts` | the hash of the plugin code a session loaded |
 | `src/extension.ts` | the omp extension: the commands, mail delivery, the peer tools, and spawned agents' lockdown |
 | `src/cli.ts` | the shell command |
 
@@ -142,7 +148,7 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 - One machine: sessions on different machines don't see each other.
 - Who can message whom is fixed by the graph (vertex ↔ its hub, hub ↔ hub); isolation is by not joining.
 - Spawning and the graph's click-to-open need kitty with a remote-control socket (see above); clicking a member that runs outside kitty only says so.
-- A message from another session is a request, not the user's instruction; each member's briefing tells it so.
+- A message from another session is a request, not the user's instruction, unless it carries a verified `user` quote; each member's briefing says so.
 - The sandbox and `peer_run` need macOS; elsewhere a spawned agent's `bash` and `peer_run` are refused.
 - The sandbox closes sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed.
 - A process that leaves a run's process group and also closes the marker file isn't found when the run ends; it stays sandboxed.

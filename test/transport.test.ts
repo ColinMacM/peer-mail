@@ -162,3 +162,17 @@ test("the graph view draws exactly the edges mail can travel", async () => {
 	expect(edges).toEqual([...new Set(reachable)].sort());
 	expect(edges).toEqual(["helper-other", "lead-other", "lead-reviewer"]);
 });
+
+test("a finished agent is skipped by broadcasts until mail sent to it by name brings it back", () => {
+	const lead = Membership.start(swarm, "s", "lead", "/r");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test"), "/r");
+	reviewer.setStatus({ status: "review done", finished: true });
+
+	expect(lead.send("all", "rebase on main").map(message => message.to)).toEqual(["tester"]);
+	lead.send("reviewer", "one more file");
+	expect(reviewer.receive().map(message => message.body)).toEqual(["one more file"]);
+	expect(swarm.peer("reviewer")).toMatchObject({ status: "review done", finished: false });
+	expect(lead.send("all", "stop").map(message => message.to).sort()).toEqual(["reviewer", "tester"]);
+	expect(tester.receive().map(message => message.body)).toEqual(["rebase on main", "stop"]);
+});

@@ -12,6 +12,7 @@
 import { parseArgs } from "node:util";
 import { DEFAULT_GRAPH_PORT, serveGraph } from "./graph";
 import { HUMAN, type Phase, Swarm } from "./transport";
+import { codeVersion } from "./version";
 
 const USAGE = `usage:
   peer-mail list
@@ -34,11 +35,13 @@ function runSwarmCommand(phase: Phase): void {
 	switch (command) {
 		case "list": {
 			console.log(`swarm ${phase.label}, started ${formatTime(phase.startedAt)} by ${phase.startedBy}`);
+			const current = codeVersion();
 			for (const peer of swarm.peers()) {
-				const state = swarm.isOnline(peer) ? "online " : "offline";
+				const state = swarm.isOnline(peer) ? (peer.finished ? "finished" : "online  ") : "offline ";
 				const waiting = swarm.pending(peer.name);
 				const place = peer.hub === null ? "hub" : `agent of ${peer.hub}`;
-				console.log(`  ${peer.name.padEnd(20)} ${state}  ${place.padEnd(20)} ${waiting ? `${waiting} waiting  ` : ""}${peer.cwd}`);
+				const old = swarm.isOnline(peer) && peer.plugin !== current ? "OLD CODE (restart)  " : "";
+				console.log(`  ${peer.name.padEnd(20)} ${state}  ${place.padEnd(20)} ${waiting ? `${waiting} waiting  ` : ""}${old}${peer.status ? `"${peer.status}"  ` : ""}${peer.cwd}`);
 			}
 			return;
 		}
