@@ -17,7 +17,12 @@ const ROLES = [
 const ctx = {
 	models: {
 		current: () => ({ provider: "anthropic", id: "claude-opus-5-5" }),
-		resolve: (spec: string) => (spec === "openai-codex/gpt-6.1-sol" ? { provider: "openai-codex", id: "gpt-6.1-sol" } : undefined),
+		resolve: (spec: string) =>
+			spec === "openai-codex/gpt-6.1-sol"
+				? { provider: "openai-codex", id: "gpt-6.1-sol" }
+				: spec === "@default"
+					? { provider: "anthropic", id: "claude-opus-5-5" }
+					: undefined,
 	},
 } as unknown as ExtensionContext;
 
@@ -25,7 +30,6 @@ function options(subscriptions: Partial<Subscription>[]): ModelOptions {
 	return {
 		subscriptions: subscriptions.map(item => ({ provider: "", agents: 0, exhausted: false, ...item })),
 		roles: ROLES,
-		models: [],
 	};
 }
 
@@ -69,4 +73,9 @@ test("a requested role or model is used as given; anything else is refused", () 
 	expect(requestedChoice(ctx, opts, "@plan").model).toBe("gpt-6.1-sol");
 	expect(requestedChoice(ctx, opts, "openai-codex/gpt-6.1-sol").selector).toBe("openai-codex/gpt-6.1-sol");
 	expect(() => requestedChoice(ctx, opts, "nope")).toThrow(/No role or model matches "nope". Roles: @smol/);
+});
+
+test("@default works even when the user's settings don't list it, since omp always has it", () => {
+	const opts = { ...options([{ provider: "anthropic" }]), roles: ROLES.filter(role => role.role !== "default") };
+	expect(requestedChoice(ctx, opts, "@default")).toMatchObject({ selector: "@default", provider: "anthropic" });
 });

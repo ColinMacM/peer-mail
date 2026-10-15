@@ -53,9 +53,13 @@ export interface ModelChoice {
 export interface ModelOptions {
 	subscriptions: Subscription[];
 	roles: RoleChoice[];
-	/** Every authenticated model, as `provider/id`. */
-	models: string[];
 }
+
+/**
+ * Providers whose models can't run subagents in omp: Cursor's models start subagents through
+ * Cursor's own protocol, which omp answers with "Subagents are not implemented by this client".
+ */
+const NO_SUBAGENTS: Record<string, true> = { cursor: true };
 
 function settingOf(value: unknown): string | undefined {
 	if (typeof value === "string") return value;
@@ -112,11 +116,7 @@ export async function subscriptions(ctx: ExtensionContext, members: Peer[]): Pro
 }
 
 export async function modelOptions(ctx: ExtensionContext, settings: HostSettings, members: Peer[]): Promise<ModelOptions> {
-	return {
-		subscriptions: await subscriptions(ctx, members),
-		roles: configuredRoles(ctx, settings),
-		models: ctx.models.list().map(model => `${model.provider}/${model.id}`),
-	};
+	return { subscriptions: await subscriptions(ctx, members), roles: configuredRoles(ctx, settings) };
 }
 
 /** How loaded a subscription is: its used fraction plus a share for each agent already on it. */
@@ -134,7 +134,7 @@ export function describeSubscription(subscription: Subscription | undefined): st
 			? "usage unknown"
 			: `${Math.round(subscription.used * 100)}% used`;
 	const agents = subscription.agents === 1 ? "1 agent on it" : `${subscription.agents} agents on it`;
-	return `${used}, ${agents}`;
+	return `${used}, ${agents}${NO_SUBAGENTS[subscription.provider] ? ", no subagents" : ""}`;
 }
 
 /**
@@ -177,6 +177,11 @@ export function requestedChoice(ctx: ExtensionContext, options: ModelOptions, sp
 	const role = options.roles.find(item => item.role === wanted);
 	if (role) {
 		return { selector: `@${role.role}`, provider: role.provider, model: role.model, role: role.role, reason: `your "${role.role}" role` };
+	}
+	// A role omp knows that isn't in the user's settings, such as the built-in `default`.
+	const builtIn = /^[a-z][a-z0-9_-]*$/i.test(wanted) ? ctx.models.resolve(`@${wanted}`) : undefined;
+	if (builtIn) {
+		return { selector: `@${wanted}`, provider: builtIn.provider, model: builtIn.id, role: wanted, reason: `omp's "${wanted}" role` };
 	}
 	const model = ctx.models.resolve(spec.trim());
 	if (!model) {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RunQueue } from "../src/queue";
+import { RunQueue, runsElsewhere } from "../src/queue";
 import { sandboxProfile, sandboxUnavailable } from "../src/sandbox";
 import { pidAlive, writeJson } from "../src/transport";
 
@@ -29,6 +29,19 @@ test("runs wait in the order queued, and a dead session's ticket doesn't hold up
 	const blocked = queue.waitTurn(third, aborted.signal, () => {});
 	aborted.abort();
 	await expect(blocked).rejects.toThrow(/Aborted/);
+});
+
+test("a run on another host over ssh takes no place in line, so local runs don't wait behind it", () => {
+	expect(runsElsewhere("ssh amr@build-2-1 'cargo test --workspace'")).toBe(true);
+	expect(runsElsewhere("  ssh -o BatchMode=yes host make")).toBe(true);
+	expect(runsElsewhere("cargo test && ssh host true")).toBe(false);
+	expect(runsElsewhere("sshfs host:/ /mnt")).toBe(false);
+	expect(runsElsewhere("timeout 600 ssh build-2 'cargo build'")).toBe(true);
+	expect(runsElsewhere("SSH_AUTH_SOCK=/tmp/agent env nice -n 5 ssh host make")).toBe(true);
+	expect(runsElsewhere("timeout 60 cargo test")).toBe(false);
+	queue.ticket("a", "ssh host 'make'", root);
+	const local = queue.enqueue("b", "make", root);
+	expect(queue.line().map(ticket => ticket.id)).toEqual([local.id]);
 });
 
 describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {

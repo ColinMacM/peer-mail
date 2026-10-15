@@ -21,9 +21,23 @@ There is one swarm at a time. Roles go in the prompt:
 (terminal 3)  plain omp: isolated, can't see or be reached by the swarm
 ```
 
-Members get `peer_list`, `peer_send` and `peer_rename`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name.
+Members get `peer_list`, `peer_send` and `peer_rename`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members.
 
-Mail interrupts its recipient, and the agent has no say in it. If the recipient is working, the extension aborts its turn along with the commands and eval it is running (the same as pressing Esc) and cancels its background jobs (`async` bash, background subagents) through omp's job manager. Once it has stopped, the mail starts a new turn, which says what was stopped. An idle recipient just starts a turn.
+How mail lands depends on who receives it:
+
+- **A hub is never interrupted.** Mail to it arrives between its steps (after the tools in flight finish), or starts a turn when it is idle. Its question boxes, commands, subagents and background jobs are left alone.
+- **A spawned agent's thinking is stopped.** If the agent is thinking, the turn is aborted and the mail starts a new one. If it is running a command or any other tool (including a question box or a `peer_run` waiting in line), the tool finishes first, and the mail arrives before its next thinking step. Background jobs are never cancelled.
+
+Mail reaches the agent as one JSON line and the body:
+
+```text
+{"from":"lead","id":"0mgrx3k1z-0001-3f2a","re":"0mgrx2f0a-0001-9c41"}
+Run the tests on build-2 and tell me what fails.
+```
+
+The briefing a member gets on joining explains this once: `re` is the message being answered, and mail comes from an agent, so it's a request, not the user's instruction or approval.
+
+A hub hears when one of its agents goes offline: `{"offline":"tester","why":"exited","last":"running bash: Run tests","unread":0}` (`why` is `stopped responding (crashed or killed)` when it died without leaving). `peer_list` shows each member's state without interrupting it: `thinking 12s`, `running bash: Run tests 3m`, `idle 40s`, or `offline 5m (exited)`.
 
 `/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one.
 
@@ -59,7 +73,7 @@ Every spawn asks you first, and you pick the model there. The dialog shows the t
 
 ### Models and subscriptions
 
-Models come from your omp `modelRoles`. A hub's `peer_models` lists them along with each subscription's usage (the fullest of its limits, e.g. 5-hour or weekly) and how many swarm agents already run on it. `peer_spawn` takes a `model`: a role (`@slow`) or a model (`openai-codex/gpt-6.1-sol`). An agent named after a role (`plan`, `slow`, …) defaults to that role. Otherwise the agent goes to the subscription with the most room: usage plus 0.1 per agent already on it. Subscriptions 90% used or exhausted are skipped while any other is left, and chore roles are never picked. Spawns therefore spread across Anthropic, OpenAI Codex and Cursor instead of using up one. The agent starts as `omp --model <role or model>`.
+Models come from your omp `modelRoles`. A hub's `peer_models` lists them along with each subscription's usage (the fullest of its limits, e.g. 5-hour or weekly), how many swarm agents already run on it, and "no subagents" for Cursor (its models start subagents through Cursor's own protocol, which omp doesn't implement). `peer_spawn` takes a `model`: a role (`@slow`, `@default`) or a model (`openai-codex/gpt-6.1-sol`). An agent named after a role (`plan`, `slow`, …) defaults to that role. Otherwise the agent goes to the subscription with the most room: usage plus 0.1 per agent already on it. Subscriptions 90% used or exhausted are skipped while any other is left, and chore roles are never picked. Spawns therefore spread across Anthropic, OpenAI Codex and Cursor instead of using up one. The agent starts as `omp --model <role or model>`.
 
 ### What spawned agents can run
 
@@ -70,7 +84,7 @@ A spawned agent is locked down so it can't set up its own way to reach other age
 - Its other tools (`read`, `write`, `grep`, …) are refused if their arguments name the peer-mail directory.
 - Its subagents are held to the same rules.
 
-Heavy work goes through `peer_run`, the machine-wide run queue: tests, builds, benchmarks, anything using shared hardware. Runs go one at a time, in the order queued; a waiting agent sees who is ahead of it. Each run executes in the same sandbox, in its own process group, with a timeout (600 s by default, 3600 s at most). When it ends, everything it started is killed, including processes that left its group but still hold the run's marker file. Mail to the agent aborts its run or its place in line. Hubs aren't sandboxed and don't use the queue.
+Heavy work on this machine goes through `peer_run`, the machine-wide run queue: tests, builds, benchmarks, anything using shared hardware. Runs go one at a time, in the order queued; a waiting agent sees who is ahead of it. Work on another computer doesn't need the queue: agents are told to run it with plain bash, and a `peer_run` command that is an `ssh` (or `mosh`) invocation, also behind `timeout`, `env`, `nice` or variable assignments, starts at once without a place in line. Each run executes in the same sandbox, in its own process group, with a timeout (600 s by default, 3600 s at most). When it ends, everything it started is killed, including processes that left its group but still hold the run's marker file. Mail never cuts a run short or costs it its place in line: it waits for the run to finish. Hubs aren't sandboxed and don't use the queue.
 
 ## Graph view
 
@@ -118,7 +132,6 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 | `src/kitty.ts` | kitty remote control: opening a split, focusing a member's window |
 | `src/graph.ts`, `src/graph.html` | the graph view's server and page |
 | `src/models.ts` | your omp roles, subscription usage, and which model a new agent gets |
-| `src/jobs.ts` | cancelling a session's background jobs when mail interrupts it |
 | `src/sandbox.ts` | the sandbox profile spawned agents' commands run in |
 | `src/queue.ts` | the run queue: waiting in line, running in the sandbox, killing what a run leaves behind |
 | `src/extension.ts` | the omp extension: the commands, mail delivery, the peer tools, and spawned agents' lockdown |
@@ -129,7 +142,7 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 - One machine: sessions on different machines don't see each other.
 - Who can message whom is fixed by the graph (vertex ↔ its hub, hub ↔ hub); isolation is by not joining.
 - Spawning and the graph's click-to-open need kitty with a remote-control socket (see above); clicking a member that runs outside kitty only says so.
-- A message from another session is a request, not the user's instruction; the delivered text tells the agent so.
+- A message from another session is a request, not the user's instruction; each member's briefing tells it so.
 - The sandbox and `peer_run` need macOS; elsewhere a spawned agent's `bash` and `peer_run` are refused.
 - The sandbox closes sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed.
 - A process that leaves a run's process group and also closes the marker file isn't found when the run ends; it stays sandboxed.

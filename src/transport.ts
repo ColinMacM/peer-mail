@@ -53,6 +53,20 @@ export interface Peer {
 	kitty?: KittyWindow;
 	/** The model the member's session runs, as `provider/id`, refreshed with each heartbeat. */
 	model?: string;
+	/** What the member was doing at its last heartbeat. */
+	activity?: Activity;
+	/** When the member's session ended (it left or exited); unset while it runs or if it crashed. */
+	leftAt?: number;
+}
+
+/** What a member is doing: thinking, running a tool (the latest one it started), or idle. */
+export interface Activity {
+	state: "thinking" | "running" | "idle";
+	/** The tool it is running, or ran last. */
+	tool?: string;
+	/** The tool call's stated intent, when it gave one. */
+	intent?: string;
+	since: number;
 }
 
 /** A kitty window, and the remote-control socket of the kitty instance that owns it. */
@@ -279,12 +293,12 @@ export class Swarm {
 		return this.peers().find(peer => peer.spawn === id);
 	}
 
-	/** Refresh a member's heartbeat (and the model it runs); false when another session has since taken its name. */
-	heartbeat(member: Peer, model?: string): boolean {
+	/** Refresh a member's heartbeat, model and activity; false when another session has since taken its name. */
+	heartbeat(member: Peer, model?: string, activity?: Activity): boolean {
 		this.requireCurrent(member.phase);
 		const peer = this.peer(member.name);
 		if (!peer || peer.pid !== member.pid || peer.phase !== member.phase) return false;
-		writeJson(this.path("peers", `${member.name}.json`), { ...peer, seenAt: Date.now(), ...(model ? { model } : {}) });
+		writeJson(this.path("peers", `${member.name}.json`), { ...peer, seenAt: Date.now(), ...(model ? { model } : {}), ...(activity ? { activity } : {}) });
 		return true;
 	}
 
@@ -292,7 +306,7 @@ export class Swarm {
 	leave(member: Peer): void {
 		const peer = this.peer(member.name);
 		if (peer && peer.pid === member.pid && peer.phase === member.phase && this.phase()?.id === member.phase) {
-			writeJson(this.path("peers", `${member.name}.json`), { ...peer, pid: null });
+			writeJson(this.path("peers", `${member.name}.json`), { ...peer, pid: null, leftAt: Date.now() });
 		}
 	}
 
@@ -305,8 +319,8 @@ export class Swarm {
 	}
 
 	/**
-	 * Post `body` from `from` to `to`, a member or `all` (every member except the sender).
-	 * Offline members keep their mail until they rejoin. Returns one message per recipient.
+	 * Post `body` from `from` to `to`: a member, or `all` (every running member it can reach).
+	 * An offline member keeps its mail until it rejoins. Returns one message per recipient.
 	 */
 	send(from: string, phase: string, to: string, body: string, replyTo?: string): Message[] {
 		this.requireCurrent(phase);
@@ -314,8 +328,10 @@ export class Swarm {
 		const reachable = this.reachable(from).map(peer => peer.name);
 		let recipients: string[];
 		if (to === BROADCAST) {
-			recipients = reachable;
-			if (recipients.length === 0) throw new Error("No member you can message has joined yet.");
+			recipients = this.reachable(from)
+				.filter(peer => this.isOnline(peer))
+				.map(peer => peer.name);
+			if (recipients.length === 0) throw new Error("No member you can message is running.");
 		} else {
 			if (!reachable.includes(to)) {
 				const why = this.peer(to)?.phase === phase ? "you can't message it" : "the swarm has no such member";
@@ -326,9 +342,9 @@ export class Swarm {
 		const sentAt = Date.now();
 		return recipients.map(recipient => {
 			// Ids sort in sending order, which is the order they are delivered: time first, then this
-			// process's counter for sends within the same millisecond.
+			// process's counter for sends within the same millisecond. Short, since agents quote them.
 			sendCounter += 1;
-			const id = `${sentAt.toString().padStart(13, "0")}-${sendCounter.toString().padStart(9, "0")}-${randomUUID().slice(0, 8)}`;
+			const id = `${sentAt.toString(36).padStart(9, "0")}-${sendCounter.toString(36).padStart(4, "0")}-${randomUUID().slice(0, 4)}`;
 			const message: Message = { id, phase, from, to: recipient, body, sentAt, ...(replyTo ? { replyTo } : {}) };
 			writeJson(this.path("inbox", recipient, `${id}.json`), message);
 			return message;

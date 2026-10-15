@@ -6,6 +6,9 @@
  *   <root>/runs/<id>.json   a queued or running run; the first live one in id order is running
  *   <root>/runs/<id>.mark   held open by the run's processes, to find them when it ends
  *
+ * A run whose command executes on another host over ssh (`runsElsewhere`) doesn't use this
+ * machine's CPU or devices, so it takes no place in line: it gets a ticket that isn't queued.
+ *
  * A ticket whose session has died is dropped by whoever reads the queue next.
  * Each run executes in the sandbox (see sandbox.ts) in its own process group. When its command
  * exits, times out or is aborted, everything it started is killed: the process group, and any
@@ -46,6 +49,14 @@ const POLL_MS = 500;
 // Orders tickets one process queues within the same millisecond.
 let ticketCounter = 0;
 
+/**
+ * Whether `command` runs on another computer: an ssh (or mosh) invocation, possibly behind
+ * variable assignments or `env`, `timeout`, `nice`, `command` or `exec`, so this machine only waits on it.
+ */
+export function runsElsewhere(command: string): boolean {
+	return /^\s*(?:(?:\w+=\S*|env|command|exec|nice(?:\s+-n\s*-?\d+)?|timeout(?:\s+-\S+)*\s+\S+)\s+)*(?:ssh|mosh)\s/.test(command);
+}
+
 export class RunQueue {
 	readonly dir: string;
 
@@ -53,11 +64,16 @@ export class RunQueue {
 		this.dir = path.join(root, "runs");
 	}
 
-	enqueue(member: string, command: string, cwd: string): RunTicket {
+	/** A ticket for a run that takes no place in line: `run` accepts it, `line` never lists it. */
+	ticket(member: string, command: string, cwd: string): RunTicket {
 		const now = Date.now();
 		const id = `${String(now).padStart(15, "0")}-${String(++ticketCounter).padStart(9, "0")}-${process.pid}`;
-		const ticket: RunTicket = { id, member, pid: process.pid, command, cwd, queuedAt: now };
-		writeJson(path.join(this.dir, `${id}.json`), ticket);
+		return { id, member, pid: process.pid, command, cwd, queuedAt: now };
+	}
+
+	enqueue(member: string, command: string, cwd: string): RunTicket {
+		const ticket = this.ticket(member, command, cwd);
+		writeJson(path.join(this.dir, `${ticket.id}.json`), ticket);
 		return ticket;
 	}
 
