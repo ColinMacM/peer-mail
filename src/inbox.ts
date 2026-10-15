@@ -1,7 +1,7 @@
 /**
  * One session's membership of a swarm: its name, its heartbeat, and its incoming mail.
  */
-import { type Message, type Peer, type Phase, Swarm } from "./transport";
+import { type Message, type Peer, Swarm } from "./transport";
 
 /** How often a member checks its inbox. */
 export const POLL_MS = 1_000;
@@ -16,13 +16,16 @@ export class Membership {
 		this.#peer = peer;
 	}
 
-	/**
-	 * Join `swarm`. `restart` (from `/startswarm`) first deletes the swarm's members and mail and
-	 * begins a new phase; otherwise the current phase is joined, or begun if there is none.
-	 */
-	static join(swarm: Swarm, desiredName: string, cwd: string, restart: boolean): Membership {
-		const by = `${desiredName} (pid ${process.pid})`;
-		const phase: Phase = restart ? swarm.start(by) : swarm.current(by);
+	/** `/startswarm`: delete the swarm's members and mail, begin a new phase labelled `label`, and join it. */
+	static start(swarm: Swarm, label: string, desiredName: string, cwd: string): Membership {
+		const phase = swarm.start(label, `${desiredName} (pid ${process.pid})`);
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd));
+	}
+
+	/** `/swarm`: join the swarm as it is now. Fails when no swarm has been started. */
+	static attach(swarm: Swarm, desiredName: string, cwd: string): Membership {
+		const phase = swarm.phase();
+		if (!phase) throw new Error("No swarm is running. Start one with /startswarm.");
 		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd));
 	}
 
@@ -51,7 +54,7 @@ export class Membership {
 		this.#peer = this.swarm.join(desiredName, previous.phase, previous.cwd);
 		if (this.name !== previous.name) {
 			this.swarm.moveInbox(previous.name, this.name);
-			this.swarm.leave(previous);
+			this.swarm.forget(previous);
 		}
 		return this.name;
 	}
@@ -70,10 +73,10 @@ export class Membership {
 }
 
 /** How a received message reads in the recipient's conversation. */
-export function formatForAgent(swarm: string, message: Message): string {
+export function formatForAgent(message: Message): string {
 	const reply = message.replyTo ? `, replying to ${message.replyTo}` : "";
 	return [
-		`Swarm ${swarm}: message from ${message.from} (id ${message.id}${reply}):`,
+		`Swarm message from ${message.from} (id ${message.id}${reply}):`,
 		"",
 		message.body,
 		"",

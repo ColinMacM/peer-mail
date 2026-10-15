@@ -1,16 +1,16 @@
 /**
- * The shared mail directory, split into swarms. Only sessions that joined a swarm can mail;
- * every other session is isolated.
+ * The one shared swarm mailbox. Only sessions that joined the swarm can mail; every other
+ * session is isolated.
  *
- *   <root>/swarms/<swarm>/phase.json                   the current phase: who started it, when
- *   <root>/swarms/<swarm>/peers/<name>.json            a member: pid, cwd, phase, last heartbeat
- *   <root>/swarms/<swarm>/inbox/<name>/<id>.json       mail waiting for <name>
- *   <root>/swarms/<swarm>/delivered/<name>/<id>.json   mail <name> has received (its history)
+ *   <root>/swarm/phase.json                   the current phase: its label, who started it, when
+ *   <root>/swarm/peers/<name>.json            a member: pid, cwd, phase, last heartbeat
+ *   <root>/swarm/inbox/<name>/<id>.json       mail waiting for <name>
+ *   <root>/swarm/delivered/<name>/<id>.json   mail <name> has received (its history)
  *
- * `/startswarm` begins a new phase: the swarm's directory is deleted and recreated, so earlier
- * members and their mail are gone. A session still holding the old phase id is stale: its
- * heartbeat, sends and receives are refused, and anything it manages to write carries the old
- * phase and is ignored by the new one.
+ * `/startswarm` begins a new phase: the directory is deleted and recreated, so earlier members
+ * and their mail are gone. A session still holding the old phase id is stale: its heartbeat,
+ * sends and receives are refused, and anything it manages to write carries the old phase and is
+ * ignored by the new one.
  *
  * Files are written to a temp name and renamed into place, so a reader never sees half a message.
  * A message is received by renaming it from inbox/ to delivered/: rename is atomic, so exactly one
@@ -23,6 +23,8 @@ import path from "node:path";
 
 export interface Phase {
 	id: string;
+	/** What this run is for, as given to /startswarm (shown to members and in status). */
+	label: string;
 	startedAt: number;
 	startedBy: string;
 }
@@ -61,8 +63,8 @@ const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 
 /** Raised when a session acts on a phase that `/startswarm` has since replaced. */
 export class StalePhaseError extends Error {
-	constructor(readonly swarm: string) {
-		super(`Swarm "${swarm}" was restarted with /startswarm; this session is no longer in it.`);
+	constructor() {
+		super("The swarm was restarted with /startswarm; this session is no longer in it.");
 	}
 }
 
@@ -118,20 +120,12 @@ function listDir(dir: string): string[] {
 	}
 }
 
-/** Swarms that currently have a phase, by name. */
-export function listSwarms(root = defaultRoot()): string[] {
-	return listDir(path.join(root, "swarms")).filter(name => fs.existsSync(path.join(root, "swarms", name, "phase.json")));
-}
-
-/** One swarm's mailboxes. Every method that acts for a member checks that its phase is current. */
+/** The swarm mailbox. Every method that acts for a member checks that its phase is current. */
 export class Swarm {
 	readonly dir: string;
 
-	constructor(
-		readonly name: string,
-		readonly root: string = defaultRoot(),
-	) {
-		this.dir = path.join(root, "swarms", normalizeName(name));
+	constructor(readonly root: string = defaultRoot()) {
+		this.dir = path.join(root, "swarm");
 	}
 
 	private path(...parts: string[]): string {
@@ -142,21 +136,16 @@ export class Swarm {
 		return readJson<Phase>(this.path("phase.json"));
 	}
 
-	/** Delete the swarm's members and mail and begin a new phase. */
-	start(by: string): Phase {
+	/** Delete every member and message and begin a new phase. */
+	start(label: string, by: string): Phase {
 		fs.rmSync(this.dir, { recursive: true, force: true });
-		const phase: Phase = { id: randomUUID(), startedAt: Date.now(), startedBy: by };
+		const phase: Phase = { id: randomUUID(), label, startedAt: Date.now(), startedBy: by };
 		writeJson(this.path("phase.json"), phase);
 		return phase;
 	}
 
-	/** The current phase, beginning one if the swarm has none yet. */
-	current(by: string): Phase {
-		return this.phase() ?? this.start(by);
-	}
-
 	private requireCurrent(phase: string): void {
-		if (this.phase()?.id !== phase) throw new StalePhaseError(this.name);
+		if (this.phase()?.id !== phase) throw new StalePhaseError();
 	}
 
 	peer(name: string): Peer | undefined {
@@ -212,6 +201,14 @@ export class Swarm {
 		}
 	}
 
+	/** Remove a member's entry entirely (it renamed itself), so no one mails the old name. */
+	forget(member: Peer): void {
+		const peer = this.peer(member.name);
+		if (peer && peer.pid === member.pid && peer.phase === member.phase) {
+			fs.rmSync(this.path("peers", `${member.name}.json`), { force: true });
+		}
+	}
+
 	/**
 	 * Post `body` from `from` to `to`, a member or `all` (every member except the sender).
 	 * Offline members keep their mail until they rejoin. Returns one message per recipient.
@@ -223,10 +220,10 @@ export class Swarm {
 		let recipients: string[];
 		if (to === BROADCAST) {
 			recipients = known.filter(name => name !== from);
-			if (recipients.length === 0) throw new Error(`No other members have joined swarm "${this.name}" yet.`);
+			if (recipients.length === 0) throw new Error("No other members have joined the swarm yet.");
 		} else {
 			if (!known.includes(to)) {
-				throw new Error(`Swarm "${this.name}" has no member "${to}". Members: ${known.join(", ") || "none"}.`);
+				throw new Error(`The swarm has no member "${to}". Members: ${known.join(", ") || "none"}.`);
 			}
 			recipients = [to];
 		}

@@ -1,42 +1,48 @@
 /**
- * peer-mail: omp sessions message each other inside named swarms.
+ * peer-mail: omp sessions message each other through one shared swarm mailbox.
  *
- *   /startswarm [name] <prompt>   start swarm `name` afresh (earlier members and mail are deleted), join it, run <prompt>
- *   /swarm [name] <prompt>        join swarm `name` as it is now (begin it if it doesn't exist), run <prompt>
- *   /swarm                        show this session's swarm and its members
- *   /swarm-leave                  leave the swarm; the session is isolated again
- *   /peer-name [name]             show or change this session's name in its swarm
+ *   /startswarm [label] <prompt>   start the swarm afresh (earlier members and mail are deleted), join it, run <prompt>
+ *   /swarm <prompt>                join the swarm that is running, run <prompt>
+ *   /swarm                         show the swarm and its members
+ *   /swarm-leave                   leave the swarm; the session is isolated again
+ *   /peer-name [name]              show or change this session's name in the swarm
  *
- * Without `[name]` the swarm is named after the session's directory. A session that hasn't joined
- * is isolated: it has no peer tools and no one can mail it. Members get `peer_list` and
- * `peer_send`; mail arrives in their conversation and starts a turn if they are idle, or is read
- * at their next step if they are working. Roles come from the prompt, not from configuration.
+ * `[label]` says what the run is for (default: the session's directory name). A session that
+ * hasn't joined is isolated: it has no peer tools and no one can mail it. Members get
+ * `peer_list`, `peer_send` and `peer_rename`; mail arrives in their conversation and starts a
+ * turn if they are idle, or is read at their next step if they are working. Roles come from the
+ * prompt, and an agent can rename itself after its role.
  */
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { formatForAgent, Membership, POLL_MS } from "./inbox";
 import { BROADCAST, HEARTBEAT_MS, StalePhaseError, Swarm } from "./transport";
 
-const TOOLS = ["peer_list", "peer_send"];
-const ISOLATED = "This session is isolated: it hasn't joined a swarm (/swarm or /startswarm).";
+const TOOLS = ["peer_list", "peer_send", "peer_rename"];
+const ISOLATED = "This session is isolated: it hasn't joined the swarm (/swarm or /startswarm).";
 const DEFAULT_NAME = "agent";
 
 // Subagent sessions rebind this factory but share the module, so they act as their main session.
 let membership: Membership | undefined;
 let poller: { ctx: ExtensionContext; timer: Timer } | undefined;
 
-/** `[name] rest` → name and rest; without brackets the whole text is the prompt. */
-function parseSwarmArgs(args: string): { swarm?: string; prompt: string } {
+/** `[label] rest` → label and rest; without brackets the whole text is the prompt. */
+function parseStartArgs(args: string): { label?: string; prompt: string } {
 	const match = /^\s*\[([^\]]*)\]\s*([\s\S]*)$/.exec(args);
-	return match ? { swarm: match[1].trim(), prompt: match[2].trim() } : { prompt: args.trim() };
+	return match ? { label: match[1].trim(), prompt: match[2].trim() } : { prompt: args.trim() };
 }
 
 export default function peerMail(pi: ExtensionAPI) {
 	const z = pi.zod;
+	const swarm = new Swarm();
 
 	async function setTools(active: boolean) {
 		const others = pi.getActiveTools().filter(name => !TOOLS.includes(name));
 		await pi.setActiveTools(active ? [...others, ...TOOLS] : others);
+	}
+
+	function showStatus(ctx: ExtensionContext) {
+		ctx.ui.setStatus("peer-mail", membership ? `✉ ${swarm.phase()?.label ?? "swarm"}/${membership.name}` : undefined);
 	}
 
 	function stopPolling() {
@@ -48,7 +54,7 @@ export default function peerMail(pi: ExtensionAPI) {
 	async function isolate(ctx: ExtensionContext) {
 		stopPolling();
 		membership = undefined;
-		ctx.ui.setStatus("peer-mail", undefined);
+		showStatus(ctx);
 		await setTools(false);
 	}
 
@@ -61,29 +67,23 @@ export default function peerMail(pi: ExtensionAPI) {
 				if (++tick % beatEvery === 0) {
 					const renamed = member.heartbeat();
 					if (renamed) {
-						ctx.ui.setStatus("peer-mail", `✉ ${member.swarm.name}/${renamed}`);
+						showStatus(ctx);
 						ctx.ui.notify(`peer-mail: your name was taken while this session was away; you are now ${renamed}`, "warning");
 					}
 				}
 				for (const message of member.receive()) {
 					// "aside": read at the agent's next step if it is working, or start a turn if idle.
 					pi.sendMessage(
-						{
-							customType: "peer-mail",
-							content: formatForAgent(member.swarm.name, message),
-							display: true,
-							details: message,
-							attribution: "agent",
-						},
+						{ customType: "peer-mail", content: formatForAgent(message), display: true, details: message, attribution: "agent" },
 						{ deliverAs: "aside" },
 					);
 				}
 			} catch (error) {
 				if (!(error instanceof StalePhaseError)) throw error;
 				void isolate(ctx);
-				ctx.ui.notify(`peer-mail: ${error.message} Run /swarm [${member.swarm.name}] to join the new one.`, "warning");
+				ctx.ui.notify(`peer-mail: ${error.message} Run /swarm to join the new one.`, "warning");
 				pi.sendMessage(
-					{ customType: "peer-mail", content: `${error.message} Don't use peer_list or peer_send.`, display: true, attribution: "agent" },
+					{ customType: "peer-mail", content: `${error.message} Don't use the peer tools.`, display: true, attribution: "agent" },
 					{ deliverAs: "nextTurn" },
 				);
 			}
@@ -91,32 +91,36 @@ export default function peerMail(pi: ExtensionAPI) {
 		poller = { ctx, timer };
 	}
 
-	async function joinSwarm(args: string, ctx: ExtensionCommandContext, restart: boolean) {
+	async function join(ctx: ExtensionCommandContext, prompt: string, label: string | undefined) {
 		if (ctx.agent.kind !== "main") return;
-		const { swarm: requested, prompt } = parseSwarmArgs(args);
 		try {
-			const swarm = new Swarm(requested || path.basename(ctx.cwd));
 			if (membership) {
 				membership.leave();
 				await isolate(ctx);
 			}
-			const member = Membership.join(swarm, process.env.PEER_MAIL_NAME || DEFAULT_NAME, ctx.cwd, restart);
+			const desired = process.env.PEER_MAIL_NAME || DEFAULT_NAME;
+			const member =
+				label === undefined
+					? Membership.attach(swarm, desired, ctx.cwd)
+					: Membership.start(swarm, label, desired, ctx.cwd);
 			membership = member;
 			await setTools(true);
 			startPolling(ctx, member);
-			ctx.ui.setStatus("peer-mail", `✉ ${swarm.name}/${member.name}`);
+			showStatus(ctx);
 
+			const runLabel = swarm.phase()?.label ?? "swarm";
 			const others = swarm
 				.peers()
 				.filter(peer => peer.name !== member.name)
 				.map(peer => peer.name);
-			const verb = restart ? "started" : "joined";
-			ctx.ui.notify(`peer-mail: ${verb} swarm ${swarm.name} as ${member.name}`, "info");
+			const verb = label === undefined ? "joined" : "started";
+			ctx.ui.notify(`peer-mail: ${verb} swarm ${runLabel} as ${member.name}`, "info");
 			pi.sendMessage(
 				{
 					customType: "peer-mail",
 					content:
-						`You ${verb} swarm "${swarm.name}" as "${member.name}". Other members: ${others.join(", ") || "none yet"}. ` +
+						`You ${verb} the swarm "${runLabel}" as "${member.name}". Other members: ${others.join(", ") || "none yet"}. ` +
+						"If your task gives you a role, first rename yourself after it with peer_rename (for example 'reviewer') so the others can address you. " +
 						"Use peer_list to see who is in the swarm and peer_send to message them; their messages arrive in this conversation. " +
 						"Sessions outside the swarm can't reach you, and you can't reach them.",
 					display: true,
@@ -141,19 +145,18 @@ export default function peerMail(pi: ExtensionAPI) {
 		name: "peer_list",
 		label: "Peer list",
 		description:
-			"List the members of your swarm you can message with peer_send: their name, whether they are running now, and their working directory. Also says your own name.",
+			"List the swarm members you can message with peer_send: their name, whether they are running now, and their working directory. Also says your own name.",
 		parameters: z.object({}),
 		approval: "read",
 		defaultInactive: true,
 		async execute() {
 			if (!membership) throw new Error(ISOLATED);
-			const swarm = membership.swarm;
 			const you = membership.name;
 			const peers = swarm
 				.peers()
 				.filter(peer => peer.name !== you)
 				.map(peer => ({ name: peer.name, online: swarm.isOnline(peer), cwd: peer.cwd }));
-			const details = { swarm: swarm.name, you, peers };
+			const details = { swarm: swarm.phase()?.label, you, peers };
 			return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
 		},
 	});
@@ -162,7 +165,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		name: "peer_send",
 		label: "Peer send",
 		description:
-			`Send a message to a member of your swarm by name (see peer_list), or to '${BROADCAST}'. It appears in that member's conversation and wakes it if idle; ` +
+			`Send a message to a swarm member by name (see peer_list), or to '${BROADCAST}'. It appears in that member's conversation and wakes it if idle; ` +
 			"a member that isn't running gets it when it rejoins. Write a self-contained request: the other agent can't see your conversation. " +
 			"Don't send acknowledgements or thanks.",
 		parameters: z.object({
@@ -185,41 +188,63 @@ export default function peerMail(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "peer_rename",
+		label: "Peer rename",
+		description:
+			"Change your name in the swarm to whatever is most convenient for the others to address you by, usually your role (for example 'reviewer' or 'programmer'). " +
+			"Mail still waiting under your old name comes along. If the name is taken by a running member you get a numbered variant; the result says which.",
+		parameters: z.object({
+			name: z.string().describe("Lowercase letters, digits, '.', '_' or '-'; other characters become '-'."),
+		}),
+		approval: "write",
+		defaultInactive: true,
+		async execute(_toolCallId, params: { name: string }, _signal, _onUpdate, ctx) {
+			if (!membership) throw new Error(ISOLATED);
+			const previous = membership.name;
+			const name = membership.rename(params.name);
+			showStatus(ctx);
+			return { content: [{ type: "text", text: `You are now "${name}" (was "${previous}").` }], details: { name, previous } };
+		},
+	});
+
 	pi.registerCommand("startswarm", {
-		description: "Start a swarm afresh (old members and mail are deleted) and join it: /startswarm [name] <prompt>",
-		handler: (args, ctx) => joinSwarm(args, ctx, true),
+		description: "Start the swarm afresh (old members and mail are deleted) and join it: /startswarm [label] <prompt>",
+		handler: async (args, ctx) => {
+			const { label, prompt } = parseStartArgs(args);
+			await join(ctx, prompt, label || path.basename(ctx.cwd));
+		},
 	});
 
 	pi.registerCommand("swarm", {
-		description: "Join a swarm as it is now: /swarm [name] <prompt>. With no arguments, show this session's swarm.",
+		description: "Join the running swarm and run <prompt>: /swarm <prompt>. Already in it: show the swarm, or run <prompt>.",
 		handler: async (args, ctx) => {
-			if (args.trim()) return joinSwarm(args, ctx, false);
-			if (!membership) {
-				ctx.ui.notify(`peer-mail: ${ISOLATED}`, "info");
+			const prompt = args.trim();
+			if (!membership) return join(ctx, prompt, undefined);
+			if (prompt) {
+				pi.sendUserMessage(prompt);
 				return;
 			}
-			const swarm = membership.swarm;
 			const members = swarm.peers().map(peer => `${peer.name}${swarm.isOnline(peer) ? "" : " (offline)"}`);
-			ctx.ui.notify(`peer-mail: swarm ${swarm.name}, you are ${membership.name}. Members: ${members.join(", ")}`, "info");
+			ctx.ui.notify(`peer-mail: swarm ${swarm.phase()?.label}, you are ${membership.name}. Members: ${members.join(", ")}`, "info");
 		},
 	});
 
 	pi.registerCommand("swarm-leave", {
-		description: "Leave this session's swarm; it becomes isolated again",
+		description: "Leave the swarm; this session becomes isolated again",
 		handler: async (_args, ctx) => {
 			if (!membership) {
 				ctx.ui.notify(`peer-mail: ${ISOLATED}`, "info");
 				return;
 			}
-			const name = membership.swarm.name;
 			membership.leave();
 			await isolate(ctx);
-			ctx.ui.notify(`peer-mail: left swarm ${name}; this session is isolated`, "info");
+			ctx.ui.notify("peer-mail: left the swarm; this session is isolated", "info");
 		},
 	});
 
 	pi.registerCommand("peer-name", {
-		description: "Show or change this session's name in its swarm: /peer-name [name]",
+		description: "Show or change this session's name in the swarm: /peer-name [name]",
 		handler: async (args, ctx) => {
 			if (!membership) {
 				ctx.ui.notify(`peer-mail: ${ISOLATED}`, "warning");
@@ -228,7 +253,7 @@ export default function peerMail(pi: ExtensionAPI) {
 			try {
 				const wanted = args.trim();
 				const name = wanted ? membership.rename(wanted) : membership.name;
-				ctx.ui.setStatus("peer-mail", `✉ ${membership.swarm.name}/${name}`);
+				showStatus(ctx);
 				ctx.ui.notify(`peer-mail: you are ${name}`, "info");
 			} catch (error) {
 				ctx.ui.notify(`peer-mail: ${(error as Error).message}`, "error");

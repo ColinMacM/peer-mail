@@ -6,9 +6,11 @@ import { Membership } from "../src/inbox";
 import { StalePhaseError, Swarm } from "../src/transport";
 
 let root: string;
+let swarm: Swarm;
 
 beforeEach(() => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "peer-mail-"));
+	swarm = new Swarm(root);
 });
 
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -18,55 +20,45 @@ function deadPid(): number {
 	return Bun.spawnSync(["true"]).pid;
 }
 
-/** A member joined from another (finished) process, so it can't collide with this test's pid. */
-function otherMember(swarm: Swarm, name: string): string {
-	const phase = swarm.current("test").id;
-	return swarm.join(name, phase, "/x", deadPid()).name;
-}
+test("/swarm attaches to the running swarm and can mail the members already there", () => {
+	const lead = Membership.start(swarm, "project_fix_robot", "lead", "/r");
+	const joiner = Membership.attach(new Swarm(root), "agent", "/r");
 
-test("members of a swarm reach each other; other swarms and isolated sessions can't", () => {
-	const robot = new Swarm("project_fix_robot", root);
-	const docs = new Swarm("docs", root);
-	const programmer = Membership.join(robot, "programmer", "/r", true);
-	otherMember(robot, "reviewer");
-	const writer = Membership.join(docs, "writer", "/d", true);
-
-	programmer.send("reviewer", "please review the gripper fix");
-	expect(() => programmer.send("writer", "hi")).toThrow(/has no member "writer". Members: programmer, reviewer/);
-	expect(() => writer.send("reviewer", "hi")).toThrow(/has no member "reviewer"/);
-	expect(robot.pending("reviewer")).toBe(1);
-});
-
-test("/startswarm ends the previous phase: old members go stale and their mail is gone", () => {
-	const swarm = new Swarm("project_fix_robot", root);
-	const old = Membership.join(swarm, "programmer", "/r", true);
-	otherMember(swarm, "reviewer");
-	old.send("reviewer", "from the old run");
-
-	const fresh = Membership.join(new Swarm("project_fix_robot", root), "lead", "/r", true);
-
-	expect(fresh.swarm.peers().map(peer => peer.name)).toEqual(["lead"]);
-	expect(fresh.swarm.pending("reviewer")).toBe(0);
-	expect(() => old.send("lead", "still there?")).toThrow(StalePhaseError);
-	expect(() => old.receive()).toThrow(StalePhaseError);
-	expect(() => old.heartbeat()).toThrow(StalePhaseError);
-});
-
-test("/swarm joins the current phase and can mail the members already there", () => {
-	const swarm = new Swarm("project_fix_robot", root);
-	const lead = Membership.join(swarm, "lead", "/r", true);
-	const joiner = Membership.join(new Swarm("project_fix_robot", root), "agent", "/r", false);
-
-	expect(joiner.swarm.peers().map(peer => peer.name).sort()).toEqual(["agent", "lead"]);
+	expect(swarm.peers().map(peer => peer.name).sort()).toEqual(["agent", "lead"]);
+	expect(swarm.phase()?.label).toBe("project_fix_robot");
 	joiner.send("lead", "I'm in");
 	expect(lead.receive().map(message => [message.from, message.body])).toEqual([["agent", "I'm in"]]);
 	expect(lead.receive()).toEqual([]);
 });
 
+test("/swarm with nothing running is refused rather than starting a swarm", () => {
+	expect(() => Membership.attach(swarm, "agent", "/r")).toThrow(/No swarm is running/);
+	expect(swarm.phase()).toBeUndefined();
+});
+
+test("only members can be addressed", () => {
+	const programmer = Membership.start(swarm, "s", "programmer", "/r");
+	expect(() => programmer.send("loner", "hi")).toThrow(/no member "loner". Members: programmer/);
+});
+
+test("/startswarm ends the previous phase: old members go stale and their mail is gone", () => {
+	const old = Membership.start(swarm, "first run", "programmer", "/r");
+	swarm.join("reviewer", old.peer.phase, "/x", deadPid());
+	old.send("reviewer", "from the old run");
+
+	const fresh = Membership.start(new Swarm(root), "second run", "lead", "/r");
+
+	expect(swarm.peers().map(peer => peer.name)).toEqual(["lead"]);
+	expect(swarm.pending("reviewer")).toBe(0);
+	expect(() => old.send("lead", "still there?")).toThrow(StalePhaseError);
+	expect(() => old.receive()).toThrow(StalePhaseError);
+	expect(() => old.heartbeat()).toThrow(StalePhaseError);
+	expect(fresh.receive()).toEqual([]);
+});
+
 test("mail is delivered once, in sending order, and kept as history", () => {
-	const swarm = new Swarm("s", root);
-	const ada = Membership.join(swarm, "ada", "/a", true);
-	const lee = Membership.join(swarm, "lee", "/b", false);
+	const ada = Membership.start(swarm, "s", "ada", "/a");
+	const lee = Membership.attach(swarm, "lee", "/b");
 	ada.send("lee", "first");
 	ada.send("lee", "second");
 
@@ -76,8 +68,7 @@ test("mail is delivered once, in sending order, and kept as history", () => {
 });
 
 test("a name held by a running session gets a suffix; a dead session's name is taken over", () => {
-	const swarm = new Swarm("s", root);
-	const phase = swarm.start("test").id;
+	const phase = swarm.start("s", "test").id;
 	const holder = Bun.spawn(["sleep", "30"]);
 	try {
 		swarm.join("agent", phase, "/r", holder.pid);
@@ -90,20 +81,23 @@ test("a name held by a running session gets a suffix; a dead session's name is t
 });
 
 test("a stale session's late write doesn't put it back in the new phase", () => {
-	const swarm = new Swarm("s", root);
-	const old = Membership.join(swarm, "ghost", "/g", true);
-	Membership.join(new Swarm("s", root), "lead", "/r", true);
+	const old = Membership.start(swarm, "s", "ghost", "/g");
+	Membership.start(new Swarm(root), "s", "lead", "/r");
 	// Its heartbeat raced the restart and landed in the new directory with the old phase.
 	fs.writeFileSync(path.join(swarm.dir, "peers", "ghost.json"), JSON.stringify(old.peer));
 
 	expect(swarm.peers().map(peer => peer.name)).toEqual(["lead"]);
 });
 
-test("renaming brings waiting mail along", () => {
-	const swarm = new Swarm("s", root);
-	const session = Membership.join(swarm, "agent", "/r", true);
-	Membership.join(swarm, "ada", "/a", false).send("agent", "for the old name");
+test("renaming to a role brings waiting mail along and frees the old name", () => {
+	const session = Membership.start(swarm, "s", "agent", "/r");
+	const ada = Membership.attach(swarm, "ada", "/a");
+	ada.send("agent", "for the old name");
 
-	expect(session.rename("reviewer")).toBe("reviewer");
-	expect(session.receive().map(message => [message.to, message.body])).toEqual([["reviewer", "for the old name"]]);
+	expect(session.rename("Reviewer Bot")).toBe("reviewer-bot");
+	expect(session.receive().map(message => [message.to, message.body])).toEqual([["reviewer-bot", "for the old name"]]);
+	ada.send("reviewer-bot", "for the new name");
+	expect(session.receive().map(message => message.body)).toEqual(["for the new name"]);
+	expect(swarm.peers().map(peer => peer.name).sort()).toEqual(["ada", "reviewer-bot"]);
+	expect(() => ada.send("agent", "to the old name")).toThrow(/no member "agent"/);
 });
