@@ -53,7 +53,7 @@ listen_on unix:/tmp/kitty
 enabled_layouts splits,stack
 ```
 
-The split goes beside the hub's window (`split`: kitty picks the axis; the agent can ask for `vertical` or `horizontal`), keeps focus on the hub, and starts in the hub's directory.
+The split goes in the hub's tab: kitty splits the largest of the hub's window and its agents' windows, so the tab fills evenly (hub plus three agents is a 2×2 grid) instead of the hub shrinking into a corner. Windows that aren't the hub's are never split. `split` lets kitty pick the axis; the agent can ask for `vertical` or `horizontal`. Focus stays on the hub, and the agent starts in the hub's directory.
 
 Every spawn asks you first, and you pick the model there. The dialog shows the task and one option per omp role (`Start on @smol`, `Start on @plan`, …). Each option shows its model and how much of that subscription is used. The hub's choice comes first, then agent roles before chore roles (`tiny`, `memory`, `commit`, `vision`), least-used subscription first. You can also type any role or model, or choose "Don't start it". The prompt appears whatever omp's approval mode is (including `--yolo`); a session with no one to ask (`omp -p`) can't spawn. If you decline, the hub is told and doesn't retry.
 

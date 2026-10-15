@@ -514,6 +514,11 @@ export default function peerMail(pi: ExtensionAPI) {
 				title: `omp · ${params.name}`,
 				env,
 				direction: params.split ?? "auto",
+				// This hub's agents in this kitty; the largest window among them and the hub is split.
+				splittable: swarm
+					.peers()
+					.filter(peer => peer.hub === membership?.name && peer.kitty?.socket === process.env.KITTY_LISTEN_ON)
+					.flatMap(peer => (peer.kitty ? [peer.kitty.window] : [])),
 			});
 			const on = `${choice.selector} (${choice.provider}/${choice.model})`;
 			const deadline = Date.now() + SPAWN_JOIN_TIMEOUT_MS;

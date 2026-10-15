@@ -43,6 +43,32 @@ export interface SplitOptions {
 	title: string;
 	env: Record<string, string>;
 	direction: SplitDirection;
+	/** Windows that may be split besides this session's own (its agents'); the largest in its tab is. */
+	splittable: number[];
+}
+
+/** The parts of `kitty @ ls` used here. */
+interface KittyLsWindow {
+	id: number;
+	columns: number;
+	lines: number;
+}
+type KittyLs = { tabs: { windows: KittyLsWindow[] }[] }[];
+
+/**
+ * The window to split for a new agent: the largest of `own` and `splittable` in `own`'s tab, so
+ * successive spawns fill the tab evenly instead of halving `own` again each time. Ties go to `own`,
+ * then to `splittable` in order.
+ */
+async function windowToSplit(socket: string, own: number, splittable: number[]): Promise<number> {
+	const tabs = (JSON.parse(await kittyRemote(socket, ["ls"])) as KittyLs).flatMap(osWindow => osWindow.tabs);
+	const windows = tabs.find(tab => tab.windows.some(window => window.id === own))?.windows ?? [];
+	let best: KittyLsWindow | undefined;
+	for (const id of [own, ...splittable]) {
+		const window = windows.find(item => item.id === id);
+		if (window && (!best || window.columns * window.lines > best.columns * best.lines)) best = window;
+	}
+	return best?.id ?? own;
 }
 
 /** Why a split can't be opened from this session, or undefined when it can. */
@@ -57,19 +83,21 @@ export function splitUnavailable(): string | undefined {
 	return undefined;
 }
 
-/** Open `command` in a new split beside this session's window, keeping focus here. Returns the new window's id. */
+/** Open `command` in a new split in this session's tab, keeping focus here. Returns the new window's id. */
 export async function openSplit(options: SplitOptions): Promise<number> {
 	const unavailable = splitUnavailable();
 	if (unavailable) throw new Error(unavailable);
-	const windowId = process.env.KITTY_WINDOW_ID as string;
-	const stdout = await kittyRemote(process.env.KITTY_LISTEN_ON as string, [
+	const socket = process.env.KITTY_LISTEN_ON as string;
+	const own = Number(process.env.KITTY_WINDOW_ID);
+	const target = await windowToSplit(socket, own, options.splittable);
+	const stdout = await kittyRemote(socket, [
 		"launch",
 		"--type=window",
 		// --match picks the tab (the one holding this window); --next-to the window to split.
 		"--match",
-		`window_id:${windowId}`,
+		`window_id:${own}`,
 		"--next-to",
-		`id:${windowId}`,
+		`id:${target}`,
 		`--location=${LOCATION[options.direction]}`,
 		"--keep-focus",
 		"--cwd",
