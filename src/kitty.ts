@@ -1,15 +1,41 @@
 /**
- * Opening a kitty split next to this session's window, through kitty's remote control socket.
+ * kitty through its remote control socket: opening a split next to this session's window, and
+ * focusing a member's window from the graph view.
  *
  * Needs kitty.conf to have `allow_remote_control yes` and `listen_on unix:/tmp/kitty` (kitty
  * appends its pid), and kitty restarted once after adding them: kitty then gives every window
  * KITTY_LISTEN_ON. Without the socket, `kitty @` would have to talk over the terminal, which the
  * running omp UI owns.
  */
+import type { KittyWindow } from "./transport";
 
 export type SplitDirection = "auto" | "vertical" | "horizontal";
 
 const LOCATION: Record<SplitDirection, string> = { auto: "split", vertical: "vsplit", horizontal: "hsplit" };
+
+/** This session's kitty window, when it runs in a kitty that has a remote-control socket. */
+export function currentKittyWindow(): KittyWindow | undefined {
+	const window = Number(process.env.KITTY_WINDOW_ID);
+	const socket = process.env.KITTY_LISTEN_ON;
+	return window && socket ? { window, socket } : undefined;
+}
+
+async function kittyRemote(socket: string, args: string[]): Promise<string> {
+	const child = Bun.spawn(["kitty", "@", "--to", socket, ...args], { stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	if (code !== 0) throw new Error(`kitty @ ${args[0]} failed: ${stderr.trim() || stdout.trim() || `exit ${code}`}`);
+	return stdout;
+}
+
+/** Bring a member's kitty window to the front: its tab, its OS window, and kitty itself. */
+export async function focusWindow(target: KittyWindow): Promise<void> {
+	await kittyRemote(target.socket, ["focus-window", "--match", `id:${target.window}`]);
+	if (process.platform === "darwin") await Bun.spawn(["osascript", "-e", 'tell application "kitty" to activate']).exited;
+}
 
 export interface SplitOptions {
 	command: string[];
@@ -36,11 +62,7 @@ export async function openSplit(options: SplitOptions): Promise<number> {
 	const unavailable = splitUnavailable();
 	if (unavailable) throw new Error(unavailable);
 	const windowId = process.env.KITTY_WINDOW_ID as string;
-	const argv = [
-		"kitty",
-		"@",
-		"--to",
-		process.env.KITTY_LISTEN_ON as string,
+	const stdout = await kittyRemote(process.env.KITTY_LISTEN_ON as string, [
 		"launch",
 		"--type=window",
 		// --match picks the tab (the one holding this window); --next-to the window to split.
@@ -56,13 +78,6 @@ export async function openSplit(options: SplitOptions): Promise<number> {
 		options.title,
 		...Object.entries(options.env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
 		...options.command,
-	];
-	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr, code] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
 	]);
-	if (code !== 0) throw new Error(`kitty @ launch failed: ${stderr.trim() || stdout.trim() || `exit ${code}`}`);
 	return Number(stdout.trim());
 }

@@ -5,37 +5,42 @@
  *   peer-mail list                        the swarm's label, and its members with mail waiting
  *   peer-mail send <to|all> <message…>    sent as "human"
  *   peer-mail history <name> [--limit N]
+ *   peer-mail graph [--port N]            serve the graph view (stops a minute after its page closes)
  *
  * Uses the same directory as the extension (PEER_MAIL_DIR, default ~/.omp/peer-mail).
  */
 import { parseArgs } from "node:util";
-import { HUMAN, Swarm } from "./transport";
+import { DEFAULT_GRAPH_PORT, serveGraph } from "./graph";
+import { HUMAN, type Phase, Swarm } from "./transport";
 
 const USAGE = `usage:
   peer-mail list
   peer-mail send <to|all> <message...>
-  peer-mail history <name> [--limit N]`;
+  peer-mail history <name> [--limit N]
+  peer-mail graph [--port N]`;
 
 const { positionals, values } = parseArgs({
 	allowPositionals: true,
-	options: { limit: { type: "string", default: "20" } },
+	options: { limit: { type: "string", default: "20" }, port: { type: "string", default: String(DEFAULT_GRAPH_PORT) } },
 });
 const [command, ...rest] = positionals;
 const swarm = new Swarm();
 
-try {
-	const phase = swarm.phase();
-	if (!phase) throw new Error("No swarm is running.");
+function formatTime(ms: number): string {
+	return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+}
+
+function runSwarmCommand(phase: Phase): void {
 	switch (command) {
 		case "list": {
-			const started = new Date(phase.startedAt).toISOString().replace("T", " ").slice(0, 19);
-			console.log(`swarm ${phase.label}, started ${started} by ${phase.startedBy}`);
+			console.log(`swarm ${phase.label}, started ${formatTime(phase.startedAt)} by ${phase.startedBy}`);
 			for (const peer of swarm.peers()) {
 				const state = swarm.isOnline(peer) ? "online " : "offline";
 				const waiting = swarm.pending(peer.name);
-				console.log(`  ${peer.name.padEnd(24)} ${state}  ${waiting ? `${waiting} waiting  ` : ""}${peer.cwd}`);
+				const place = peer.hub === null ? "hub" : `agent of ${peer.hub}`;
+				console.log(`  ${peer.name.padEnd(20)} ${state}  ${place.padEnd(20)} ${waiting ? `${waiting} waiting  ` : ""}${peer.cwd}`);
 			}
-			break;
+			return;
 		}
 		case "send": {
 			const [to, ...words] = rest;
@@ -43,19 +48,28 @@ try {
 			for (const message of swarm.send(HUMAN, phase.id, to, words.join(" "))) {
 				console.log(`sent to ${message.to} (id ${message.id})`);
 			}
-			break;
+			return;
 		}
 		case "history": {
 			const [name] = rest;
 			if (!name) throw new Error(USAGE);
 			for (const message of swarm.history(name, Number(values.limit))) {
-				const when = new Date(message.sentAt).toISOString().replace("T", " ").slice(0, 19);
-				console.log(`[${when}] ${message.from} → ${message.to}  (${message.id})\n${message.body}\n`);
+				console.log(`[${formatTime(message.sentAt)}] ${message.from} → ${message.to}  (${message.id})\n${message.body}\n`);
 			}
-			break;
+			return;
 		}
 		default:
 			throw new Error(USAGE);
+	}
+}
+
+try {
+	if (command === "graph") {
+		serveGraph(swarm, Number(values.port));
+	} else {
+		const phase = swarm.phase();
+		if (!phase) throw new Error("No swarm is running.");
+		runSwarmCommand(phase);
 	}
 } catch (error) {
 	console.error((error as Error).message);

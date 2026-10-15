@@ -147,3 +147,18 @@ test("a hub that renames itself keeps its vertices", () => {
 	expect(reviewer.send("lead", "done").map(message => message.to)).toEqual(["lead"]);
 	expect(swarm.reachable("lead").map(peer => peer.name)).toEqual(["reviewer"]);
 });
+
+test("the graph view draws exactly the edges mail can travel", async () => {
+	const { graphState } = await import("../src/graph");
+	const lead = Membership.start(swarm, "s", "lead", "/r");
+	const other = Membership.attach(swarm, "other", "/o");
+	Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+	Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help"), "/o");
+
+	const edges = graphState(swarm).edges.map(edge => [...edge].sort().join("-")).sort();
+	const reachable = swarm
+		.peers()
+		.flatMap(peer => swarm.reachable(peer.name).map(to => [peer.name, to.name].sort().join("-")));
+	expect(edges).toEqual([...new Set(reachable)].sort());
+	expect(edges).toEqual(["helper-other", "lead-other", "lead-reviewer"]);
+});

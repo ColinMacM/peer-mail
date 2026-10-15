@@ -10,6 +10,7 @@ An omp extension that lets omp sessions on one machine message each other throug
 | `/swarm <prompt>` | Joins the swarm that is running and runs `<prompt>`; refused if none is running |
 | `/swarm` | Shows the swarm and its members |
 | `/swarm-leave` | Leaves the swarm; the session is isolated again |
+| `/swarm-graph` | Opens the graph view in the browser |
 | `/peer-name [name]` | Shows or changes this session's name in the swarm |
 
 There is one swarm at a time. Roles go in the prompt:
@@ -54,6 +55,14 @@ enabled_layouts splits,stack
 
 The split goes beside the hub's window (`split`: kitty picks the axis; the agent can ask for `vertical` or `horizontal`), keeps focus on the hub, and starts in the hub's directory.
 
+Every spawn asks you first: the hub shows "Start a new agent "reviewer"?" with the task it would get, and nothing opens unless you choose Yes. This prompt appears whatever omp's approval mode is (including `--yolo`); a session with no one to ask (`omp -p`) can't spawn. If you decline, the hub is told and doesn't retry.
+
+## Graph view
+
+`/swarm-graph` opens a page in your browser that draws the swarm live: hubs, their agents, and the edges mail can travel. Members that aren't running are drawn hollow, a badge shows mail waiting, edges light up when a message crosses them, and recent mail is listed on the right. Click a running member to bring its omp window in kitty to the front; drag members to arrange them.
+
+The page is served by `bun src/cli.ts graph` on `http://127.0.0.1:7577/` (`PEER_MAIL_GRAPH_PORT` changes it), which `/swarm-graph` starts in the background. It stops by itself a minute after the page is closed.
+
 ## Install
 
 ```bash
@@ -89,7 +98,8 @@ Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the r
 |---|---|
 | `src/transport.ts` | the swarm mail directory: phases, members and their graph, send, receive, spawn requests |
 | `src/inbox.ts` | one session's membership, and how a message reads to the agent |
-| `src/kitty.ts` | opening a kitty split through kitty's remote-control socket |
+| `src/kitty.ts` | kitty remote control: opening a split, focusing a member's window |
+| `src/graph.ts`, `src/graph.html` | the graph view's server and page |
 | `src/extension.ts` | the omp extension: the commands, mail delivery, and the peer tools |
 | `src/cli.ts` | the shell command |
 
@@ -97,7 +107,7 @@ Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the r
 
 - One machine: sessions on different machines don't see each other.
 - Who can message whom is fixed by the graph (vertex ↔ its hub, hub ↔ hub); isolation is by not joining.
-- Spawning needs kitty with a remote-control socket (see above).
+- Spawning and the graph's click-to-open need kitty with a remote-control socket (see above); clicking a member that runs outside kitty only says so.
 - A message from another session is a request, not the user's instruction; the delivered text tells the agent so.
 - Background jobs are stopped by the agent following the instruction in the mail, not by the extension itself (omp gives extensions no way to cancel them).
 - `omp -p` runs have no slash commands, so they can't join.

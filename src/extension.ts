@@ -17,8 +17,10 @@
  * recipient: a working agent's turn is aborted (with its running commands and eval), then the
  * mail starts a new turn. Roles come from the prompt, and an agent can rename itself after its role.
  */
+import { spawn } from "node:child_process";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { DEFAULT_GRAPH_PORT, graphRunning } from "./graph";
 import { formatForAgent, Membership, POLL_MS } from "./inbox";
 import { openSplit, type SplitDirection, splitUnavailable } from "./kitty";
 import { BROADCAST, HEARTBEAT_MS, type Message, StalePhaseError, Swarm } from "./transport";
@@ -291,13 +293,15 @@ export default function peerMail(pi: ExtensionAPI) {
 		description:
 			"Start another agent: a new omp session in a kitty split beside this one, working on `prompt`. It joins the swarm as one of your vertices: " +
 			"it can only message you (with peer_send), and its messages arrive in your conversation. Give it a role name and a self-contained prompt " +
-			"(it can't see your conversation), including what to report back to you and when. Only hubs can spawn. Waits until the agent has joined.",
+			"(it can't see your conversation), including what to report back to you and when. Only hubs can spawn. The user is asked to approve every spawn; " +
+			"if they decline, don't retry the same spawn. Waits until the agent has joined.",
 		parameters: z.object({
 			name: z.string().describe("Its name in the swarm, usually its role, e.g. 'reviewer'."),
 			prompt: z.string().describe("Its task, written for an agent that can't see your conversation."),
 			split: z.enum(["auto", "vertical", "horizontal"]).optional().describe("How to split this window (default auto)."),
 		}),
-		approval: "exec",
+		// The tool asks the user itself (below), showing the name and prompt, so the generic approval gate doesn't ask twice.
+		approval: { tier: "exec", policy: "allow" },
 		defaultInactive: true,
 		async execute(
 			_toolCallId,
@@ -311,6 +315,13 @@ export default function peerMail(pi: ExtensionAPI) {
 			if (hub !== null) throw new Error(`Only hubs can spawn agents; you are an agent of ${hub}.`);
 			const unavailable = splitUnavailable();
 			if (unavailable) throw new Error(unavailable);
+			// A spawn always needs the user's say-so, whatever the approval mode; with no one to ask, it's refused.
+			if (!ctx.hasUI) throw new Error("Spawning an agent needs the user's permission, and this session has no one to ask.");
+			const approved = await ctx.ui.confirm(
+				`Start a new agent "${params.name}"?`,
+				`${membership.name} wants to open a kitty split running omp in ${ctx.cwd}, with this task:\n\n${params.prompt}`,
+			);
+			if (!approved) throw new Error(`The user declined to start "${params.name}".`);
 			const request = swarm.requestSpawn(membership.peer, params.name, params.prompt);
 			const env: Record<string, string> = { PEER_MAIL_SPAWN: request.id, PATH: process.env.PATH ?? "" };
 			if (process.env.PEER_MAIL_DIR) env.PEER_MAIL_DIR = process.env.PEER_MAIL_DIR;
@@ -354,6 +365,26 @@ export default function peerMail(pi: ExtensionAPI) {
 			}
 			const members = swarm.peers().map(peer => `${peer.name}${swarm.isOnline(peer) ? "" : " (offline)"}`);
 			ctx.ui.notify(`peer-mail: swarm ${swarm.phase()?.label}, you are ${membership.name}. Members: ${members.join(", ")}`, "info");
+		},
+	});
+
+	pi.registerCommand("swarm-graph", {
+		description: "Open the swarm's graph view in the browser; click a member to bring its omp window to the front",
+		handler: async (_args, ctx) => {
+			const url = `http://127.0.0.1:${DEFAULT_GRAPH_PORT}/`;
+			if (!(await graphRunning())) {
+				// Its own process, so the view outlives this session; it stops a minute after its page closes.
+				const cli = new URL("./cli.ts", import.meta.url).pathname;
+				spawn(Bun.which("bun") ?? process.execPath, [cli, "graph"], { detached: true, stdio: "ignore" }).unref();
+				const deadline = Date.now() + 5_000;
+				while (!(await graphRunning()) && Date.now() < deadline) await Bun.sleep(150);
+				if (!(await graphRunning())) {
+					ctx.ui.notify(`peer-mail: the graph view didn't start (is port ${DEFAULT_GRAPH_PORT} taken?)`, "error");
+					return;
+				}
+			}
+			Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdout: "ignore", stderr: "ignore" });
+			ctx.ui.notify(`peer-mail: graph view at ${url}`, "info");
 		},
 	});
 

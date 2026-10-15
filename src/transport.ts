@@ -49,6 +49,14 @@ export interface Peer {
 	hub: string | null;
 	/** The spawn request this member was started for, if it was spawned. */
 	spawn?: string;
+	/** Where the member's session runs in kitty, so the graph view can focus it. */
+	kitty?: KittyWindow;
+}
+
+/** A kitty window, and the remote-control socket of the kitty instance that owns it. */
+export interface KittyWindow {
+	window: number;
+	socket: string;
 }
 
 /** A hub's request for a new vertex, read by the session the hub launches. */
@@ -65,6 +73,7 @@ export interface JoinOptions {
 	pid?: number;
 	hub?: string | null;
 	spawn?: string;
+	kitty?: KittyWindow;
 }
 
 export interface Message {
@@ -218,6 +227,7 @@ export class Swarm {
 				seenAt: now,
 				hub: options.hub ?? null,
 				...(options.spawn ? { spawn: options.spawn } : {}),
+				...(options.kitty ? { kitty: options.kitty } : {}),
 			};
 			writeJson(this.path("peers", `${name}.json`), peer);
 			return peer;

@@ -1,6 +1,7 @@
 /**
  * One session's membership of a swarm: its name, its heartbeat, and its incoming mail.
  */
+import { currentKittyWindow } from "./kitty";
 import { type JoinOptions, type Message, type Peer, type SpawnRequest, Swarm } from "./transport";
 
 /** How often a member checks its inbox. */
@@ -19,19 +20,20 @@ export class Membership {
 	/** `/startswarm`: delete the swarm's members and mail, begin a new phase labelled `label`, and join it. */
 	static start(swarm: Swarm, label: string, desiredName: string, cwd: string): Membership {
 		const phase = swarm.start(label, `${desiredName} (pid ${process.pid})`);
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd));
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow() }));
 	}
 
 	/** `/swarm`: join the swarm as it is now. Fails when no swarm has been started. */
 	static attach(swarm: Swarm, desiredName: string, cwd: string): Membership {
 		const phase = swarm.phase();
 		if (!phase) throw new Error("No swarm is running. Start one with /startswarm.");
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd));
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow() }));
 	}
 
 	/** A session a hub launched with peer_spawn: join as the vertex its request names. */
 	static spawned(swarm: Swarm, request: SpawnRequest, cwd: string): Membership {
-		return new Membership(swarm, swarm.join(request.name, request.phase, cwd, { hub: request.hub, spawn: request.id }));
+		const placement = { hub: request.hub, spawn: request.id, kitty: currentKittyWindow() };
+		return new Membership(swarm, swarm.join(request.name, request.phase, cwd, placement));
 	}
 
 	get name(): string {
@@ -50,7 +52,7 @@ export class Membership {
 
 	/** The join options that keep this member's place in the graph when it joins again. */
 	#placement(): JoinOptions {
-		return { hub: this.hub, ...(this.#peer.spawn ? { spawn: this.#peer.spawn } : {}) };
+		return { hub: this.hub, kitty: this.#peer.kitty, ...(this.#peer.spawn ? { spawn: this.#peer.spawn } : {}) };
 	}
 
 	/**

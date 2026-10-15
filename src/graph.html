@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>peer-mail swarm</title>
+<style>
+  :root { --bg: #1e1e2e; --fg: #cdd6f4; --muted: #7f849c; --edge: #45475a; --hub: #cba6f7; --agent: #89b4fa; --mail: #f9e2af; --panel: #181825; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #eff1f5; --fg: #4c4f69; --muted: #8c8fa1; --edge: #bcc0cc; --hub: #8839ef; --agent: #1e66f5; --mail: #df8e1d; --panel: #e6e9ef; }
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px -apple-system, system-ui, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 340px; }
+  #graph { width: 100%; height: 100vh; cursor: grab; }
+  header { position: absolute; top: 12px; left: 16px; pointer-events: none; }
+  header h1 { font-size: 16px; margin: 0; }
+  header p { margin: 2px 0 0; color: var(--muted); }
+  aside { background: var(--panel); height: 100vh; overflow-y: auto; padding: 12px 14px; box-sizing: border-box; }
+  aside h2 { font-size: 13px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; }
+  .msg { margin-bottom: 12px; }
+  .msg .who { color: var(--muted); font-size: 12px; }
+  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .edge { stroke: var(--edge); stroke-width: 1.5; }
+  .edge.hot { stroke: var(--mail); stroke-width: 3; }
+  .node circle { stroke: var(--bg); stroke-width: 3; }
+  .node.hub circle { fill: var(--hub); }
+  .node.agent circle { fill: var(--agent); }
+  .node.offline circle { fill: var(--bg); stroke: var(--muted); stroke-dasharray: 4 3; stroke-width: 2; }
+  .node.focusable { cursor: pointer; }
+  .node.focusable:hover circle { stroke: var(--fg); }
+  .node text { fill: var(--fg); font-size: 12px; text-anchor: middle; pointer-events: none; }
+  .badge circle { fill: var(--mail); stroke: none; }
+  .badge text { fill: var(--bg); font-size: 10px; font-weight: 700; }
+  #toast { position: absolute; bottom: 16px; left: 16px; background: var(--panel); padding: 8px 12px; border-radius: 6px; opacity: 0; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
+  .legend { color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+<div style="position: relative">
+  <header><h1 id="label">swarm</h1><p id="sub"></p><p class="legend"><span style="color: var(--hub)">●</span> hub &nbsp; <span style="color: var(--agent)">●</span> agent &nbsp; ◌ offline · click a running member to open it</p></header>
+  <svg id="graph"><g id="edges"></g><g id="nodes"></g></svg>
+  <div id="toast"></div>
+</div>
+<aside><h2>Recent mail</h2><div id="messages"></div></aside>
+<script>
+const svg = document.getElementById("graph");
+const edgeLayer = document.getElementById("edges");
+const nodeLayer = document.getElementById("nodes");
+const NS = "http://www.w3.org/2000/svg";
+const sim = new Map(); // name -> {x, y, vx, vy, pinned}
+let state = { nodes: [], edges: [], messages: [] };
+let dragging = null;
+
+function el(tag, attrs, parent) {
+  const node = document.createElementNS(NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+
+function toast(text) {
+  const box = document.getElementById("toast");
+  box.textContent = text;
+  box.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => box.classList.remove("show"), 2500);
+}
+
+async function focusMember(name) {
+  const response = await fetch(`/focus/${encodeURIComponent(name)}`, { method: "POST" });
+  const body = await response.json();
+  toast(response.ok ? `Opened ${name}` : body.error);
+}
+
+function radius(node) { return node.hub === null ? 22 : 14; }
+
+function render() {
+  const { width, height } = svg.getBoundingClientRect();
+  for (const node of state.nodes) {
+    if (!sim.has(node.name)) {
+      const hub = node.hub && sim.get(node.hub);
+      const angle = Math.random() * Math.PI * 2;
+      sim.set(node.name, {
+        x: (hub ? hub.x : width / 2) + Math.cos(angle) * 80,
+        y: (hub ? hub.y : height / 2) + Math.sin(angle) * 80,
+        vx: 0, vy: 0, pinned: false,
+      });
+    }
+  }
+  for (const name of [...sim.keys()]) if (!state.nodes.some(node => node.name === name)) sim.delete(name);
+
+  const now = Date.now();
+  const hot = new Set(state.messages.filter(m => now - m.sentAt < 8000).map(m => [m.from, m.to].sort().join("|")));
+  edgeLayer.replaceChildren();
+  for (const [a, b] of state.edges) {
+    const p = sim.get(a), q = sim.get(b);
+    if (!p || !q) continue;
+    el("line", { x1: p.x, y1: p.y, x2: q.x, y2: q.y, class: `edge${hot.has([a, b].sort().join("|")) ? " hot" : ""}` }, edgeLayer);
+  }
+  nodeLayer.replaceChildren();
+  for (const node of state.nodes) {
+    const p = sim.get(node.name);
+    const kind = node.hub === null ? "hub" : "agent";
+    const group = el("g", {
+      class: `node ${kind}${node.online ? "" : " offline"}${node.focusable ? " focusable" : ""}`,
+      transform: `translate(${p.x},${p.y})`,
+    }, nodeLayer);
+    el("circle", { r: radius(node) }, group);
+    el("text", { y: radius(node) + 15 }, group).textContent = node.name;
+    const title = el("title", {}, group);
+    title.textContent = `${node.name} · ${kind}${node.hub ? ` of ${node.hub}` : ""} · ${node.online ? "running" : "offline"}\n${node.cwd}`;
+    if (node.pending > 0) {
+      const badge = el("g", { class: "badge", transform: `translate(${radius(node) * 0.75},${-radius(node) * 0.75})` }, group);
+      el("circle", { r: 8 }, badge);
+      el("text", { y: 3.5 }, badge).textContent = String(node.pending);
+    }
+    group.addEventListener("pointerdown", event => {
+      dragging = { name: node.name, moved: false, startX: event.clientX, startY: event.clientY };
+      svg.setPointerCapture(event.pointerId);
+    });
+  }
+}
+
+svg.addEventListener("pointermove", event => {
+  if (!dragging) return;
+  const p = sim.get(dragging.name);
+  if (!p) return;
+  if (Math.hypot(event.clientX - dragging.startX, event.clientY - dragging.startY) > 4) dragging.moved = true;
+  const box = svg.getBoundingClientRect();
+  Object.assign(p, { x: event.clientX - box.left, y: event.clientY - box.top, vx: 0, vy: 0, pinned: true });
+});
+svg.addEventListener("pointerup", () => {
+  if (!dragging) return;
+  const node = state.nodes.find(n => n.name === dragging.name);
+  if (!dragging.moved && node) {
+    if (node.focusable) focusMember(node.name);
+    else toast(node.online ? `${node.name} isn't in a kitty window this can reach` : `${node.name} isn't running`);
+  }
+  const p = sim.get(dragging.name);
+  if (p) p.pinned = dragging.moved; // a dragged member stays where it was dropped
+  dragging = null;
+});
+
+function step() {
+  const { width, height } = svg.getBoundingClientRect();
+  const entries = [...sim.entries()];
+  for (const [, p] of entries) { p.fx = (width / 2 - p.x) * 0.002; p.fy = (height / 2 - p.y) * 0.002; }
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const p = entries[i][1], q = entries[j][1];
+      let dx = p.x - q.x, dy = p.y - q.y;
+      const d2 = Math.max(dx * dx + dy * dy, 100);
+      const force = 4000 / d2, d = Math.sqrt(d2);
+      dx /= d; dy /= d;
+      p.fx += dx * force; p.fy += dy * force; q.fx -= dx * force; q.fy -= dy * force;
+    }
+  }
+  for (const [a, b] of state.edges) {
+    const p = sim.get(a), q = sim.get(b);
+    if (!p || !q) continue;
+    const dx = q.x - p.x, dy = q.y - p.y, d = Math.max(Math.hypot(dx, dy), 1);
+    const length = state.nodes.find(n => n.name === b)?.hub === null ? 200 : 110;
+    const force = (d - length) * 0.01;
+    p.fx += dx / d * force; p.fy += dy / d * force; q.fx -= dx / d * force; q.fy -= dy / d * force;
+  }
+  for (const [, p] of entries) {
+    if (p.pinned) continue;
+    p.vx = (p.vx + p.fx) * 0.85; p.vy = (p.vy + p.fy) * 0.85;
+    p.x = Math.min(Math.max(p.x + p.vx, 30), width - 30);
+    p.y = Math.min(Math.max(p.y + p.vy, 60), height - 30);
+  }
+  render();
+  requestAnimationFrame(step);
+}
+
+function showMessages() {
+  const list = document.getElementById("messages");
+  list.replaceChildren();
+  for (const message of [...state.messages].reverse()) {
+    const item = document.createElement("div");
+    item.className = "msg";
+    const when = new Date(message.sentAt).toLocaleTimeString();
+    item.innerHTML = '<div class="who"></div><div class="body"></div>';
+    item.querySelector(".who").textContent = `${when} · ${message.from} → ${message.to}`;
+    item.querySelector(".body").textContent = message.body;
+    list.appendChild(item);
+  }
+  if (state.messages.length === 0) list.textContent = "No mail yet.";
+}
+
+async function poll() {
+  try {
+    state = await (await fetch("/state")).json();
+    document.getElementById("label").textContent = state.label ? `swarm · ${state.label}` : "no swarm running";
+    const online = state.nodes.filter(node => node.online).length;
+    document.getElementById("sub").textContent = state.startedAt
+      ? `${online}/${state.nodes.length} running · started ${new Date(state.startedAt).toLocaleTimeString()}`
+      : "Start one in omp with /startswarm";
+    showMessages();
+  } catch {
+    document.getElementById("sub").textContent = "graph server stopped";
+  }
+}
+
+poll();
+setInterval(poll, 1500);
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
