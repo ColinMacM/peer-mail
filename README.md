@@ -23,7 +23,7 @@ There is one swarm at a time. Roles go in the prompt:
 
 Members get `peer_list`, `peer_send` and `peer_rename`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name.
 
-Mail interrupts its recipient. If the recipient is working, its turn is aborted along with the commands and eval it is running (the same as pressing Esc), and the mail starts a new turn once it has stopped; an idle recipient just starts a turn. Background jobs (`async` bash, background subagents) can't be cancelled from an extension, so the delivered mail lists any still running and tells the agent to stop them first with `write proc://<id>/kill`.
+Mail interrupts its recipient, and the agent has no say in it. If the recipient is working, the extension aborts its turn along with the commands and eval it is running (the same as pressing Esc) and cancels its background jobs (`async` bash, background subagents) through omp's job manager. Once it has stopped, the mail starts a new turn, which says what was stopped. An idle recipient just starts a turn.
 
 `/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one.
 
@@ -55,7 +55,22 @@ enabled_layouts splits,stack
 
 The split goes beside the hub's window (`split`: kitty picks the axis; the agent can ask for `vertical` or `horizontal`), keeps focus on the hub, and starts in the hub's directory.
 
-Every spawn asks you first: the hub shows "Start a new agent "reviewer"?" with the task it would get, and nothing opens unless you choose Yes. This prompt appears whatever omp's approval mode is (including `--yolo`); a session with no one to ask (`omp -p`) can't spawn. If you decline, the hub is told and doesn't retry.
+Every spawn asks you first, and you pick the model there. The dialog shows the task and one option per omp role (`Start on @smol`, `Start on @plan`, …). Each option shows its model and how much of that subscription is used. The hub's choice comes first, then agent roles before chore roles (`tiny`, `memory`, `commit`, `vision`), least-used subscription first. You can also type any role or model, or choose "Don't start it". The prompt appears whatever omp's approval mode is (including `--yolo`); a session with no one to ask (`omp -p`) can't spawn. If you decline, the hub is told and doesn't retry.
+
+### Models and subscriptions
+
+Models come from your omp `modelRoles`. A hub's `peer_models` lists them along with each subscription's usage (the fullest of its limits, e.g. 5-hour or weekly) and how many swarm agents already run on it. `peer_spawn` takes a `model`: a role (`@slow`) or a model (`openai-codex/gpt-6.1-sol`). An agent named after a role (`plan`, `slow`, …) defaults to that role. Otherwise the agent goes to the subscription with the most room: usage plus 0.1 per agent already on it. Subscriptions 90% used or exhausted are skipped while any other is left, and chore roles are never picked. Spawns therefore spread across Anthropic, OpenAI Codex and Cursor instead of using up one. The agent starts as `omp --model <role or model>`.
+
+### What spawned agents can run
+
+A spawned agent is locked down so it can't set up its own way to reach other agents:
+
+- Its `bash` runs in a macOS sandbox (`sandbox-exec`). Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket or the graph view's port. The kitty and peer-mail environment variables are removed. Outbound network, the repo and everything else work.
+- It has no `eval` (kernels can't be sandboxed), and `bash` can't start long-lived services (`name`/`ready`).
+- Its other tools (`read`, `write`, `grep`, …) are refused if their arguments name the peer-mail directory.
+- Its subagents are held to the same rules.
+
+Heavy work goes through `peer_run`, the machine-wide run queue: tests, builds, benchmarks, anything using shared hardware. Runs go one at a time, in the order queued; a waiting agent sees who is ahead of it. Each run executes in the same sandbox, in its own process group, with a timeout (600 s by default, 3600 s at most). When it ends, everything it started is killed, including processes that left its group but still hold the run's marker file. Mail to the agent aborts its run or its place in line. Hubs aren't sandboxed and don't use the queue.
 
 ## Graph view
 
@@ -82,7 +97,7 @@ bun src/cli.ts history reviewer            # what a member has received
 
 ## How it works
 
-Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the root):
+Everything is files under `~/.omp/peer-mail/` (`PEER_MAIL_DIR` moves it). The swarm lives in `swarm/`:
 
 | Path | Holds |
 |---|---|
@@ -92,6 +107,8 @@ Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the r
 | `delivered/<name>/<id>.json` | mail received |
 | `spawns/<id>.json` | a hub's request for a new agent, until that session starts and takes it |
 
+The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop waiting runs: `runs/<id>.json` is a queued run (the first one whose session is alive is running), `runs/<id>.mark` is the marker file its processes hold. Tickets of sessions that have died are dropped by the next reader.
+
 `/startswarm` deletes the directory and writes a new phase. Every member action checks its phase against `phase.json`, and peers and messages from another phase are ignored. Members check their inbox every second; a message is received by renaming it from `inbox/` to `delivered/`, so exactly one session gets it.
 
 | File | Does |
@@ -100,7 +117,11 @@ Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the r
 | `src/inbox.ts` | one session's membership, and how a message reads to the agent |
 | `src/kitty.ts` | kitty remote control: opening a split, focusing a member's window |
 | `src/graph.ts`, `src/graph.html` | the graph view's server and page |
-| `src/extension.ts` | the omp extension: the commands, mail delivery, and the peer tools |
+| `src/models.ts` | your omp roles, subscription usage, and which model a new agent gets |
+| `src/jobs.ts` | cancelling a session's background jobs when mail interrupts it |
+| `src/sandbox.ts` | the sandbox profile spawned agents' commands run in |
+| `src/queue.ts` | the run queue: waiting in line, running in the sandbox, killing what a run leaves behind |
+| `src/extension.ts` | the omp extension: the commands, mail delivery, the peer tools, and spawned agents' lockdown |
 | `src/cli.ts` | the shell command |
 
 ## Limits
@@ -109,7 +130,9 @@ Everything is files under `~/.omp/peer-mail/swarm/` (`PEER_MAIL_DIR` moves the r
 - Who can message whom is fixed by the graph (vertex ↔ its hub, hub ↔ hub); isolation is by not joining.
 - Spawning and the graph's click-to-open need kitty with a remote-control socket (see above); clicking a member that runs outside kitty only says so.
 - A message from another session is a request, not the user's instruction; the delivered text tells the agent so.
-- Background jobs are stopped by the agent following the instruction in the mail, not by the extension itself (omp gives extensions no way to cancel them).
+- The sandbox and `peer_run` need macOS; elsewhere a spawned agent's `bash` and `peer_run` are refused.
+- The sandbox closes sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed.
+- A process that leaves a run's process group and also closes the marker file isn't found when the run ends; it stays sandboxed.
 - `omp -p` runs have no slash commands, so they can't join.
 
 ## Development

@@ -51,6 +51,8 @@ export interface Peer {
 	spawn?: string;
 	/** Where the member's session runs in kitty, so the graph view can focus it. */
 	kitty?: KittyWindow;
+	/** The model the member's session runs, as `provider/id`, refreshed with each heartbeat. */
+	model?: string;
 }
 
 /** A kitty window, and the remote-control socket of the kitty instance that owns it. */
@@ -74,6 +76,7 @@ export interface JoinOptions {
 	hub?: string | null;
 	spawn?: string;
 	kitty?: KittyWindow;
+	model?: string;
 }
 
 export interface Message {
@@ -123,7 +126,7 @@ export function normalizeName(raw: string): string {
 	return name;
 }
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -133,14 +136,14 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-function writeJson(file: string, value: unknown): void {
+export function writeJson(file: string, value: unknown): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
 	fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`);
 	fs.renameSync(temp, file);
 }
 
-function readJson<T>(file: string): T | undefined {
+export function readJson<T>(file: string): T | undefined {
 	try {
 		return JSON.parse(fs.readFileSync(file, "utf8")) as T;
 	} catch (error) {
@@ -149,7 +152,7 @@ function readJson<T>(file: string): T | undefined {
 	}
 }
 
-function listDir(dir: string): string[] {
+export function listDir(dir: string): string[] {
 	try {
 		return fs.readdirSync(dir).sort();
 	} catch (error) {
@@ -228,6 +231,7 @@ export class Swarm {
 				hub: options.hub ?? null,
 				...(options.spawn ? { spawn: options.spawn } : {}),
 				...(options.kitty ? { kitty: options.kitty } : {}),
+				...(options.model ? { model: options.model } : {}),
 			};
 			writeJson(this.path("peers", `${name}.json`), peer);
 			return peer;
@@ -275,12 +279,12 @@ export class Swarm {
 		return this.peers().find(peer => peer.spawn === id);
 	}
 
-	/** Refresh a member's heartbeat; false when another session has since taken its name. */
-	heartbeat(member: Peer): boolean {
+	/** Refresh a member's heartbeat (and the model it runs); false when another session has since taken its name. */
+	heartbeat(member: Peer, model?: string): boolean {
 		this.requireCurrent(member.phase);
 		const peer = this.peer(member.name);
 		if (!peer || peer.pid !== member.pid || peer.phase !== member.phase) return false;
-		writeJson(this.path("peers", `${member.name}.json`), { ...peer, seenAt: Date.now() });
+		writeJson(this.path("peers", `${member.name}.json`), { ...peer, seenAt: Date.now(), ...(model ? { model } : {}) });
 		return true;
 	}
 
