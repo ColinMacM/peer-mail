@@ -351,9 +351,10 @@ export default function peerMail(pi: ExtensionAPI) {
 			if (!membership) throw new Error(ISOLATED);
 			const unavailable = sandboxUnavailable();
 			if (unavailable) throw new Error(unavailable);
-			const timeout = Math.min(Math.max(params.timeout ?? RUN_TIMEOUT_DEFAULT_S, 1), RUN_TIMEOUT_MAX_S);
+			// Some models fill every optional field (empty strings, zeros); those mean "not given".
+			const timeout = Math.min(params.timeout && params.timeout > 0 ? params.timeout : RUN_TIMEOUT_DEFAULT_S, RUN_TIMEOUT_MAX_S);
 			const remote = runsElsewhere(params.command);
-			const cwd = path.resolve(ctx.cwd, params.cwd ?? ".");
+			const cwd = path.resolve(ctx.cwd, params.cwd?.trim() || ".");
 			const ticket = remote ? runs.ticket(membership.name, params.command, cwd) : runs.enqueue(membership.name, params.command, cwd);
 			try {
 				if (!remote) {
@@ -438,7 +439,7 @@ export default function peerMail(pi: ExtensionAPI) {
 				.string()
 				.optional()
 				.describe(
-					"The user's own words, copied exactly from a message they sent you or a question-box answer. Checked against your session; the recipient sees them as the user's.",
+					"The user's own words, copied exactly from a message they sent you or a question-box answer; omit if none. Checked against your session: the recipient sees them as the user's, and words the user didn't say are dropped (the message still goes, and you're told).",
 				),
 		}),
 		approval: "write",
@@ -446,8 +447,18 @@ export default function peerMail(pi: ExtensionAPI) {
 		// The published typings don't infer zod schemas into `params`; this matches the schema above.
 		async execute(_toolCallId, params: { to: string; message: string; reply_to?: string; user_quote?: string }, _signal, _onUpdate, ctx) {
 			if (!membership) throw new Error(ISOLATED);
-			const user = params.user_quote === undefined ? undefined : verifiedQuote(ctx.sessionManager, params.user_quote);
-			const sent = membership.send(params.to, params.message, { replyTo: params.reply_to, user });
+			// Some models fill every optional field, so a blank reply_to or user_quote means none.
+			const replyTo = params.reply_to?.trim() || undefined;
+			const quote = params.user_quote?.trim() || undefined;
+			// A quote that isn't the user's words is dropped rather than blocking the message; the sender is told.
+			let user: string | undefined;
+			let dropped = "";
+			try {
+				user = quote === undefined ? undefined : verifiedQuote(ctx.sessionManager, quote);
+			} catch (error) {
+				dropped = ` Sent without user_quote: ${(error as Error).message}`;
+			}
+			const sent = membership.send(params.to, params.message, { replyTo, user });
 			const recipients = sent.map(message => message.to);
 			const ids = sent.map(message => message.id);
 			const offline = recipients.filter(name => {
@@ -456,7 +467,7 @@ export default function peerMail(pi: ExtensionAPI) {
 			});
 			const warning = offline.length > 0 ? ` ${offline.join(", ")} is offline: it won't read this unless its session comes back.` : "";
 			return {
-				content: [{ type: "text", text: `Sent to ${recipients.join(", ")} (id ${ids.join(", ")}).${warning}` }],
+				content: [{ type: "text", text: `Sent to ${recipients.join(", ")} (id ${ids.join(", ")}).${warning}${dropped}` }],
 				details: { recipients, ids, offline },
 			};
 		},
@@ -476,7 +487,8 @@ export default function peerMail(pi: ExtensionAPI) {
 		defaultInactive: true,
 		async execute(_toolCallId, params: { status?: string; finished?: boolean }) {
 			if (!membership) throw new Error(ISOLATED);
-			const update = { ...(params.status !== undefined ? { status: params.status.trim() } : {}), ...(params.finished !== undefined ? { finished: params.finished } : {}) };
+			const status = params.status?.trim();
+			const update = { ...(status ? { status } : {}), ...(params.finished !== undefined ? { finished: params.finished } : {}) };
 			membership.setStatus(update);
 			return { content: [{ type: "text", text: "Status set." }], details: update };
 		},
@@ -615,7 +627,7 @@ export default function peerMail(pi: ExtensionAPI) {
 			if (!ctx.hasUI) throw new Error("Spawning an agent needs the user's permission, and this session has no one to ask.");
 			const options = await modelOptions(ctx, pi.pi.settings, swarm.peers());
 			// An agent named after one of the user's roles runs on that role unless the hub says otherwise.
-			const spec = params.model ?? (options.roles.some(role => role.role === params.name) ? `@${params.name}` : undefined);
+			const spec = params.model?.trim() || (options.roles.some(role => role.role === params.name) ? `@${params.name}` : undefined);
 			const proposed = spec ? requestedChoice(ctx, options, spec) : autoChoice(ctx, options);
 			if (!proposed) throw new Error("No model is available to run the agent on.");
 			const choice = await approveSpawn(ctx, params.name, params.prompt, proposed, options);
