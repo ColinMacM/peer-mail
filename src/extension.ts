@@ -582,7 +582,9 @@ export default function peerMail(pi: ExtensionAPI) {
 			"it can only message you (with peer_send), and its messages arrive in your conversation. Give it a role name and a full brief as `prompt`: " +
 			"it starts knowing nothing of your conversation, so put in everything it needs. Choose its model with `model` (see peer_models): " +
 			"one of the user's omp roles ('@slow', '@plan', …) suited to its work, or a model; leave it out to use the subscription with the most room. " +
-			"Only hubs can spawn. The user approves every spawn and may change the model; if they decline, don't retry the same spawn. Waits until the agent has joined.",
+			"Only hubs can spawn. The user approves every spawn and may change the model; if they decline, don't retry the same spawn. Waits until the agent has joined. " +
+			"Spawn early: when your task has work for other agents, start them before doing your own investigation, and let each inspect its own area. " +
+			"If they need something you are still preparing (a contract, a decision), spawn them anyway to investigate read-only, and send it when ready.",
 		parameters: z.object({
 			name: z.string().describe("Its name in the swarm, usually its role, e.g. 'reviewer'."),
 			prompt: z
