@@ -79,3 +79,11 @@ test("@default works even when the user's settings don't list it, since omp alwa
 	const opts = { ...options([{ provider: "anthropic" }]), roles: ROLES.filter(role => role.role !== "default") };
 	expect(requestedChoice(ctx, opts, "@default")).toMatchObject({ selector: "@default", provider: "anthropic" });
 });
+
+test("an agent is launched by provider/model with its role's thinking level, never by @alias (omp's CLI matched @default to a Vertex model)", () => {
+	const opts = options([{ provider: "anthropic" }, { provider: "openai-codex" }, { provider: "cursor" }]);
+	expect(requestedChoice(ctx, opts, "@default").launch).toBe("anthropic/claude-opus-5-5");
+	expect(requestedChoice(ctx, opts, "slow").launch).toBe("anthropic/claude-fable-5-1:high");
+	expect(requestedChoice(ctx, opts, "openai-codex/gpt-6.1-sol").launch).toBe("openai-codex/gpt-6.1-sol");
+	expect(autoChoice(ctx, options([{ provider: "cursor", used: 0.1 }, { provider: "anthropic", used: 0.5 }]))?.launch).toBe("cursor/grok-4.7");
+});

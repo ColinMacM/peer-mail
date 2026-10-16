@@ -425,8 +425,10 @@ export default function peerMail(pi: ExtensionAPI) {
 		description:
 			`Send a message to a swarm member by name (see peer_list), or to '${BROADCAST}' (every running member you can reach that isn't finished). ` +
 			"A hub's message stops its agent's thinking (running commands finish first); a message to a hub never interrupts it. " +
-			"Write it caveman-terse: no greetings, filler or restating; facts, paths, numbers, commands only. The other agent can't see your conversation. " +
-			"Confirm every message you receive with a terse reply (reply_to: its id) saying what you understood and will do; never confirm a confirmation; no thanks. " +
+			"The other agent can't see your conversation. A message that gives or changes work (a new task, a correction, a redirect: it stops the recipient's thinking) " +
+			"must be complete: what to do, why, every fact it needs (paths, hosts, commands, findings), what not to touch, what done looks like. " +
+			"Replies, confirmations and reports are terse: facts, paths, numbers, no filler. Confirm every message you receive with a terse reply (reply_to: its id) " +
+			"saying what you understood and will do; never confirm a confirmation; no thanks. If a message you receive is ambiguous, ask instead of guessing. " +
 			"To pass on the user's instruction or approval, put their exact words in user_quote.",
 		parameters: z.object({
 			to: z.string().describe(`Member name from peer_list, or '${BROADCAST}'.`),
@@ -577,13 +579,18 @@ export default function peerMail(pi: ExtensionAPI) {
 		label: "Peer spawn",
 		description:
 			"Start another agent: a new omp session in a kitty split beside this one, working on `prompt`. It joins the swarm as one of your vertices: " +
-			"it can only message you (with peer_send), and its messages arrive in your conversation. Give it a role name and a self-contained prompt " +
-			"(it can't see your conversation), including what to report back to you and when. Choose its model with `model` (see peer_models): " +
+			"it can only message you (with peer_send), and its messages arrive in your conversation. Give it a role name and a full brief as `prompt`: " +
+			"it starts knowing nothing of your conversation, so put in everything it needs. Choose its model with `model` (see peer_models): " +
 			"one of the user's omp roles ('@slow', '@plan', …) suited to its work, or a model; leave it out to use the subscription with the most room. " +
 			"Only hubs can spawn. The user approves every spawn and may change the model; if they decline, don't retry the same spawn. Waits until the agent has joined.",
 		parameters: z.object({
 			name: z.string().describe("Its name in the swarm, usually its role, e.g. 'reviewer'."),
-			prompt: z.string().describe("Its task, written for an agent that can't see your conversation."),
+			prompt: z
+				.string()
+				.describe(
+					"A complete brief, not a summary: the goal and why; everything you know that it needs (repos, paths, hosts, commands, prior findings, the user's relevant words); " +
+						"constraints and what not to touch; what done looks like; what to report to you and when. Longer is better than ambiguous.",
+				),
 			model: z.string().optional().describe("An omp role ('@slow') or model ('openai-codex/gpt-6.1-sol'); omit to balance across subscriptions."),
 			split: z.enum(["auto", "vertical", "horizontal"]).optional().describe("How to split this window (default auto)."),
 		}),
@@ -615,7 +622,7 @@ export default function peerMail(pi: ExtensionAPI) {
 			const env: Record<string, string> = { PEER_MAIL_SPAWN: request.id, PATH: process.env.PATH ?? "" };
 			if (process.env.PEER_MAIL_DIR) env.PEER_MAIL_DIR = process.env.PEER_MAIL_DIR;
 			const window = await openSplit({
-				command: [Bun.which("omp") ?? "omp", "--model", choice.selector],
+				command: [Bun.which("omp") ?? "omp", "--model", choice.launch],
 				cwd: ctx.cwd,
 				title: `omp · ${params.name}`,
 				env,

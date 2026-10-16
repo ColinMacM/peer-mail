@@ -41,13 +41,26 @@ export interface RoleChoice {
 }
 
 export interface ModelChoice {
-	/** What goes to `omp --model`: `@role` or `provider/id`. */
+	/** How the choice reads to the user and the hub: `@role` or `provider/id`. */
 	selector: string;
+	/**
+	 * What goes to `omp --model`: always `provider/id`, with the role's thinking level. Never a
+	 * role alias: the CLI matches model ids before roles, so `@default` picks a Vertex model whose
+	 * id ends in `@default`.
+	 */
+	launch: string;
 	provider: string;
 	model: string;
 	role?: string;
 	/** Why it was chosen, shown to the user and the hub. */
 	reason: string;
+}
+
+/** `provider/model`, plus the thinking level `setting` (a role's configured value) gives that same model. */
+function launchSpec(provider: string, model: string, setting?: string): string {
+	const first = setting?.split(",")[0]?.trim();
+	const level = first && first.replace(/:[a-z]+$/, "") === `${provider}/${model}` ? /:([a-z]+)$/.exec(first)?.[1] : undefined;
+	return `${provider}/${model}${level ? `:${level}` : ""}`;
 }
 
 export interface ModelOptions {
@@ -148,7 +161,8 @@ export function autoChoice(ctx: ExtensionContext, options: ModelOptions): ModelC
 	if (candidates.length === 0) {
 		const current = ctx.models.current();
 		if (!current) return undefined;
-		return { selector: `${current.provider}/${current.id}`, provider: current.provider, model: current.id, reason: "this session's model (no omp roles are configured)" };
+		const launch = `${current.provider}/${current.id}`;
+		return { selector: launch, launch, provider: current.provider, model: current.id, reason: "this session's model (no omp roles are configured)" };
 	}
 	const rank = (role: RoleChoice) => {
 		const preference = ROLE_PREFERENCE.indexOf(role.role);
@@ -164,6 +178,7 @@ export function autoChoice(ctx: ExtensionContext, options: ModelOptions): ModelC
 	)[0];
 	return {
 		selector: `@${best.role}`,
+		launch: launchSpec(best.provider, best.model, best.setting),
 		provider: best.provider,
 		model: best.model,
 		role: best.role,
@@ -176,17 +191,18 @@ export function requestedChoice(ctx: ExtensionContext, options: ModelOptions, sp
 	const wanted = spec.trim().replace(/^@/, "");
 	const role = options.roles.find(item => item.role === wanted);
 	if (role) {
-		return { selector: `@${role.role}`, provider: role.provider, model: role.model, role: role.role, reason: `your "${role.role}" role` };
+		return { selector: `@${role.role}`, launch: launchSpec(role.provider, role.model, role.setting), provider: role.provider, model: role.model, role: role.role, reason: `your "${role.role}" role` };
 	}
 	// A role omp knows that isn't in the user's settings, such as the built-in `default`.
 	const builtIn = /^[a-z][a-z0-9_-]*$/i.test(wanted) ? ctx.models.resolve(`@${wanted}`) : undefined;
 	if (builtIn) {
-		return { selector: `@${wanted}`, provider: builtIn.provider, model: builtIn.id, role: wanted, reason: `omp's "${wanted}" role` };
+		return { selector: `@${wanted}`, launch: `${builtIn.provider}/${builtIn.id}`, provider: builtIn.provider, model: builtIn.id, role: wanted, reason: `omp's "${wanted}" role` };
 	}
 	const model = ctx.models.resolve(spec.trim());
 	if (!model) {
 		const known = options.roles.map(item => `@${item.role}`).join(", ");
 		throw new Error(`No role or model matches "${spec}". Roles: ${known || "none"}; or name one of the models peer_models lists.`);
 	}
-	return { selector: `${model.provider}/${model.id}`, provider: model.provider, model: model.id, reason: "as requested" };
+	const launch = `${model.provider}/${model.id}`;
+	return { selector: launch, launch, provider: model.provider, model: model.id, reason: "as requested" };
 }
