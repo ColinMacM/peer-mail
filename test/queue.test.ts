@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { RunQueue, runsElsewhere } from "../src/queue";
-import { sandboxProfile, sandboxUnavailable } from "../src/sandbox";
+import { sandboxedCommand, sandboxProfile, sandboxUnavailable } from "../src/sandbox";
 import { pidAlive, writeJson } from "../src/transport";
 
 let root: string;
@@ -63,6 +63,15 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 		const ok = await queue.run({ ...ticket, command: 'echo $((6 * 7)); test -z "$PEER_MAIL_DIR"' }, profile(), 10_000, undefined);
 		expect(ok).toMatchObject({ exitCode: 0, timedOut: false });
 		expect(ok.output).toBe("42\n");
+	});
+
+	test("a command already sandboxed is not wrapped again, and still runs", () => {
+		const once = sandboxedCommand("echo $((6 * 7))", profile());
+		expect(sandboxedCommand(once, profile())).toBe(once);
+		expect(sandboxedCommand(once, sandboxProfile(path.join(root, "other"), 7577))).not.toBe(once);
+		const run = Bun.spawnSync(["/bin/bash", "-c", sandboxedCommand(sandboxedCommand("echo $((6 * 7))", profile()), profile())]);
+		expect(run.exitCode).toBe(0);
+		expect(run.stdout.toString()).toBe("42\n");
 	});
 
 	test("nothing a run starts outlives it, even a process that left its group", async () => {

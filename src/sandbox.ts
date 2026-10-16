@@ -56,7 +56,12 @@ export function sandboxedArgv(command: string, profile: string): string[] {
 	return ["/usr/bin/env", ...SWARM_ENV.flatMap(name => ["-u", name]), SANDBOX_EXEC, "-p", profile, "/bin/bash", "-c", command];
 }
 
-/** `command` rewritten as a shell command line that runs it inside the sandbox. */
+/** `command` rewritten as a shell command line that runs it inside the sandbox. A command this
+ * already wrapped with the same profile is returned unchanged: the `tool_call` hook can see a bash
+ * call more than once (subagents share this module), and every pass used to nest another
+ * `sandbox-exec`, which macOS may refuse to start inside a sandbox. */
 export function sandboxedCommand(command: string, profile: string): string {
+	const prefix = `${sandboxedArgv("", profile).slice(0, -1).map(quote).join(" ")} `;
+	if (command.startsWith(prefix)) return command;
 	return sandboxedArgv(command, profile).map(quote).join(" ");
 }
