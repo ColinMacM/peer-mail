@@ -17,7 +17,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { sandboxedArgv } from "./sandbox";
+import { sandboxScript } from "./sandbox";
 import { listDir, pidAlive, readJson, writeJson } from "./transport";
 
 export interface RunTicket {
@@ -120,8 +120,7 @@ export class RunQueue {
 		const started = Date.now();
 		const markFile = path.join(this.dir, `${ticket.id}.mark`);
 		const mark = fs.openSync(markFile, "w");
-		const [file, ...args] = sandboxedArgv(ticket.command, profile);
-		const child = spawn(file, args, { cwd: ticket.cwd, detached: true, stdio: ["ignore", "pipe", "pipe", mark] });
+		const child = spawn(sandboxScript(profile), [ticket.command], { cwd: ticket.cwd, detached: true, stdio: ["ignore", "pipe", "pipe", mark] });
 		fs.closeSync(mark);
 		let output = "";
 		const collect = (chunk: Buffer) => {

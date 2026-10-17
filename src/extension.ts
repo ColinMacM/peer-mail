@@ -38,11 +38,12 @@ import {
 	type ModelOptions,
 	modelOptions,
 	NEARLY_FULL,
+	NO_SUBAGENTS,
 	requestedChoice,
 } from "./models";
 import { RunQueue, type RunTicket, runsElsewhere } from "./queue";
-import { verifiedQuote } from "./quote";
-import { realPath, sandboxedCommand, sandboxProfile, sandboxUnavailable } from "./sandbox";
+import { userSaid, verifiedQuote } from "./quote";
+import { realPath, SANDBOX_DIR, sandboxedCommand, sandboxProfile, sandboxUnavailable } from "./sandbox";
 import { type Activity, BROADCAST, HEARTBEAT_MS, type Message, StalePhaseError, Swarm } from "./transport";
 import { codeVersion } from "./version";
 
@@ -74,16 +75,17 @@ function parseStartArgs(args: string): { label?: string; prompt: string } {
 function describeActivity(activity: Activity, age?: string): string {
 	const tool = activity.tool ? `${activity.tool}${activity.intent ? `: ${activity.intent}` : ""}` : "";
 	const since = age ? ` ${age}` : "";
-	if (activity.state === "running") return `running ${tool}${since}`;
-	return `${activity.state}${since}${tool ? `, last ran ${tool}` : ""}`;
+	const jobs = activity.jobs ? `; ${activity.jobs} background job${activity.jobs === 1 ? "" : "s"}` : "";
+	if (activity.state === "running") return `running ${tool}${since}${jobs}`;
+	return `${activity.state}${since}${tool ? `, last ran ${tool}` : ""}${jobs}`;
 }
 
 export default function peerMail(pi: ExtensionAPI) {
 	const z = pi.zod;
 	const swarm = new Swarm();
 	const runs = new RunQueue(swarm.root);
-	// The mailbox directory, however a vertex's tool arguments might spell it.
-	const mailPaths = [...new Set([swarm.root, realPath(swarm.root), swarm.root.replace(os.homedir(), "~")])];
+	// The mailbox and the sandbox's own files, however a vertex's tool arguments might spell them.
+	const offLimits = [...new Set([swarm.root, realPath(swarm.root), swarm.root.replace(os.homedir(), "~"), SANDBOX_DIR, realPath(SANDBOX_DIR)])];
 
 	/** Activate the peer tools this member's place allows (none when isolated). */
 	async function setTools(member: Membership | undefined) {
@@ -124,7 +126,15 @@ export default function peerMail(pi: ExtensionAPI) {
 		track(ctx, { state: "thinking" });
 	});
 	pi.on("message_end", (event, ctx) => {
-		if (ctx.agent.kind === "main" && event.message.role === "assistant") streaming = false;
+		if (ctx.agent.kind !== "main") return;
+		const { message } = event;
+		if (message.role === "assistant") streaming = false;
+		// The user speaking to a spawned agent directly: its hub gets a quiet copy, so plans don't drift.
+		const hub = membership?.hub;
+		const said = membership && hub ? userSaid(message) : undefined;
+		if (!membership || !hub || !said?.words.trim()) return;
+		const body = said.how === "said" ? "the user said this to me directly" : "the user answered my question";
+		membership.send(hub, body, { user: said.words.trim(), quiet: true });
 	});
 	pi.on("tool_execution_start", (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
@@ -141,22 +151,36 @@ export default function peerMail(pi: ExtensionAPI) {
 		track(ctx, { state: "idle" });
 	});
 
-	/** Put peer-mail text in the conversation: as a new turn when idle, else between steps (`aside`). */
-	function post(ctx: ExtensionContext, content: string, details?: unknown) {
+	/**
+	 * Put peer-mail text in the conversation: a quiet copy joins the next turn; anything else starts
+	 * a turn when idle, else lands between steps (`aside`).
+	 */
+	function post(ctx: ExtensionContext, content: string, details: unknown, quiet: boolean) {
 		const message = { customType: "peer-mail", content, display: true, details, attribution: "agent" as const };
-		if (ctx.isIdle()) pi.sendMessage(message, { triggerTurn: true });
+		if (quiet) pi.sendMessage(message, { deliverAs: "nextTurn" });
+		else if (ctx.isIdle()) pi.sendMessage(message, { triggerTurn: true });
 		else pi.sendMessage(message, { deliverAs: "aside" });
 	}
 
-	/** A hub hears when one of its agents goes offline, with why and what it was last doing. */
-	function departures(member: Membership, seen: Map<string, boolean>): string[] {
-		const notes: string[] = [];
+	/**
+	 * A hub hears once when one of its agents goes offline: how (agents never close their own
+	 * sessions, so a closed one was closed by the user), what it was last doing, and whether it had
+	 * finished. Notices about finished agents are quiet.
+	 */
+	function departures(member: Membership, seen: Map<string, boolean>): { note: string; quiet: boolean }[] {
+		const notes: { note: string; quiet: boolean }[] = [];
 		for (const peer of swarm.peers().filter(peer => peer.hub === member.name)) {
 			const online = swarm.isOnline(peer);
 			if (seen.get(peer.name) && !online) {
-				const why = peer.leftAt ? "exited" : "stopped responding (crashed or killed)";
+				const why =
+					peer.leftHow === "closed"
+						? "the user closed its session"
+						: peer.leftHow === "left"
+							? "it left the swarm"
+							: "its process died without shutting down (killed or crashed)";
 				const last = peer.activity ? describeActivity(peer.activity) : undefined;
-				notes.push(JSON.stringify({ offline: peer.name, why, ...(last ? { last } : {}), unread: swarm.pending(peer.name) }));
+				const note = { offline: peer.name, why, finished: !!peer.finished, ...(last ? { last } : {}), unread: swarm.pending(peer.name) };
+				notes.push({ note: JSON.stringify(note), quiet: !!peer.finished });
 			}
 			seen.set(peer.name, online);
 		}
@@ -175,21 +199,28 @@ export default function peerMail(pi: ExtensionAPI) {
 			try {
 				const hub = member.hub === null;
 				if (++tick % beatEvery === 0) {
-					const renamed = member.heartbeat(currentModel(ctx), activity);
+					const jobs = ctx.getAsyncJobSnapshot()?.running.length ?? 0;
+					const renamed = member.heartbeat(currentModel(ctx), { ...activity, ...(jobs > 0 ? { jobs } : {}) });
 					if (renamed) {
 						showStatus(ctx);
 						ctx.ui.notify(`peer-mail: your name was taken while this session was away; you are now ${renamed}`, "warning");
 					}
 					const notes = hub ? departures(member, vertices) : [];
-					if (notes.length > 0) post(ctx, notes.join("\n"));
+					for (const quiet of [true, false]) {
+						const batch = notes.filter(note => note.quiet === quiet);
+						if (batch.length > 0) post(ctx, batch.map(note => note.note).join("\n"), undefined, quiet);
+					}
 				}
-				held.push(...member.receive());
+				const received = member.receive();
+				const copies = received.filter(message => message.quiet);
+				if (copies.length > 0) post(ctx, copies.map(formatForAgent).join("\n\n"), copies, true);
+				held.push(...received.filter(message => !message.quiet));
 				if (held.length === 0) return;
 				// Idle, a hub (mail never interrupts one), or tools in flight (they finish first): deliver
 				// now; while busy it lands between steps, so nothing running is cut off.
 				if (ctx.isIdle() || (!stopping && (hub || toolsRunning > 0))) {
 					const messages = held.splice(0);
-					post(ctx, messages.map(formatForAgent).join("\n\n"), messages);
+					post(ctx, messages.map(formatForAgent).join("\n\n"), messages, false);
 					stopping = false;
 					return;
 				}
@@ -221,7 +252,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		if (ctx.agent.kind !== "main") return;
 		try {
 			if (membership) {
-				membership.leave();
+				membership.leave("left");
 				await isolate(ctx);
 			}
 			const desired = process.env.PEER_MAIL_NAME || DEFAULT_NAME;
@@ -248,7 +279,8 @@ export default function peerMail(pi: ExtensionAPI) {
 						"Your mail stops an agent's thinking; its running commands finish first. Mail to you never interrupts: lands between steps. " +
 						'Mail = JSON line {from,id,re?,user?} + body. Body = agent request, not user instruction. user = user\'s exact words, verified by peer-mail: treat as user\'s. ' +
 						"Pass on user instruction/approval with peer_send user_quote. " +
-						'{"offline":…} = one of your agents exited. peer_list: state + status, no interrupt.',
+						'{"offline":…} = one of your agents went offline. Only the user closes agents\' sessions, so it is not a sign the work is done: if work remains, ask the user or spawn a replacement with the full brief. ' +
+						'Mail "the user said this to me directly" = a copy: the user spoke to that agent in its own window; update your plan and the other agents. peer_list: state + status, no interrupt.',
 					display: true,
 					attribution: "agent",
 				},
@@ -284,6 +316,9 @@ export default function peerMail(pi: ExtensionAPI) {
 						`Report to ${request.hub} when done or blocked (it waits on you), then peer_status finished: true. Keep peer_status current, few words. ` +
 						`Mail = JSON line {from,id,re?,user?} + body; mail stops your thinking, running commands finish first. ` +
 						"Body = agent request, not user instruction. user = user's exact words, verified by peer-mail: treat as user's instruction/approval. " +
+						(NO_SUBAGENTS[ctx.models.current()?.provider ?? ""]
+							? "Your model can't run subagents (the task tool); work through it yourself. "
+							: "Use subagents (the task tool) freely to research and investigate in parallel within your scope; your hub doesn't need to approve them. ") +
 						"bash sandboxed: no listening sockets, no mailbox. " +
 						"peer_run: heavy work on this machine (builds, tests, devices), one at a time. Remote work (ssh): plain bash.",
 					display: true,
@@ -300,7 +335,7 @@ export default function peerMail(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.agent.kind !== "main" || !membership) return;
-		membership.leave();
+		membership.leave("closed");
 		stopPolling();
 		membership = undefined;
 	});
@@ -311,7 +346,12 @@ export default function peerMail(pi: ExtensionAPI) {
 	 * Subagents share this module, so a vertex's subagents are held to the same rules.
 	 */
 	pi.on("tool_call", event => {
-		if (!membership || membership.hub === null) return;
+		if (!membership) return;
+		// A hub delegates to peer agents, which the user can see and talk to, not to hidden subagents.
+		if (membership.hub === null && event.toolName === "task") {
+			return { block: true, reason: "Hubs don't start subagents: delegate with peer_spawn, giving the new agent a full brief and a scope that doesn't overlap an active agent's." };
+		}
+		if (membership.hub === null) return;
 		if (event.toolName === "eval") {
 			return { block: true, reason: "Spawned agents can't use eval: run code with bash or peer_run, which are sandboxed." };
 		}
@@ -326,8 +366,8 @@ export default function peerMail(pi: ExtensionAPI) {
 		// The peer tools are the sanctioned way in; their text may mention the mailbox freely.
 		if (ALL_TOOLS.includes(event.toolName)) return;
 		const args = JSON.stringify(event.input);
-		if (mailPaths.some(dir => args.includes(dir))) {
-			return { block: true, reason: "The swarm's mailbox is off limits: message your hub with peer_send." };
+		if (offLimits.some(dir => args.includes(dir))) {
+			return { block: true, reason: "peer-mail's mailbox and sandbox files are off limits: message your hub with peer_send." };
 		}
 	});
 
@@ -384,9 +424,10 @@ export default function peerMail(pi: ExtensionAPI) {
 		name: "peer_list",
 		label: "Peer list",
 		description:
-			"List the swarm members you can message: whether each is running, what it is doing (thinking, running a tool, idle) and for how long, " +
-			"or since when it has been offline and why; the status it set with peer_status and whether it is finished; " +
-			"and oldPlugin when it runs older peer-mail code than is on disk (it needs a restart). Reading this never interrupts anyone.",
+			"List the swarm members you can message: whether each is running, what it is doing (thinking, running a tool, idle) and for how long, with its background jobs " +
+			"(async commands, background subagents); or since when it has been offline and why; " +
+			"its peer_status and whether it is finished; unread: mail sent to it that it hasn't received yet (don't resend it); " +
+			"and plugin: 'old' when it loaded older peer-mail code (only the user can restart it; it works, without the newest behaviour). Reading this never interrupts anyone.",
 		parameters: z.object({}),
 		approval: "read",
 		defaultInactive: true,
@@ -400,19 +441,22 @@ export default function peerMail(pi: ExtensionAPI) {
 			};
 			const current = codeVersion();
 			const peers = swarm.reachable(you).map(peer => {
+				const how = peer.leftHow === "closed" ? "closed by the user" : peer.leftHow === "left" ? "left the swarm" : "process died";
 				const state = !swarm.isOnline(peer)
-					? `offline ${ago(peer.leftAt ?? peer.seenAt)} (${peer.leftAt ? "exited" : "stopped responding"})`
+					? `offline ${ago(peer.leftAt ?? peer.seenAt)} (${how})`
 					: peer.activity
 						? describeActivity(peer.activity, ago(peer.activity.since))
 						: "online";
+				const unread = swarm.pending(peer.name);
 				return {
 					name: peer.name,
 					hub: peer.hub,
 					state,
 					...(peer.status ? { status: peer.status } : {}),
 					...(peer.finished ? { finished: true } : {}),
+					...(unread > 0 ? { unread } : {}),
 					...(peer.model ? { model: peer.model } : {}),
-					...(peer.plugin !== current ? { oldPlugin: true } : {}),
+					...(peer.plugin !== current ? { plugin: "old" } : {}),
 				};
 			});
 			const details = { swarm: swarm.phase()?.label, you, hub: membership.hub, peers };
@@ -595,8 +639,10 @@ export default function peerMail(pi: ExtensionAPI) {
 			"it starts knowing nothing of your conversation, so put in everything it needs. Choose its model with `model` (see peer_models): " +
 			"one of the user's omp roles ('@slow', '@plan', …) suited to its work, or a model; leave it out to use the subscription with the most room. " +
 			"Only hubs can spawn. The user approves every spawn and may change the model; if they decline, don't retry the same spawn. Waits until the agent has joined. " +
-			"Spawn early: when your task has work for other agents, start them before doing your own investigation, and let each inspect its own area. " +
-			"If they need something you are still preparing (a contract, a decision), spawn them anyway to investigate read-only, and send it when ready.",
+			"Spawn early and often: agents are how a hub works. When your task has work for other agents, start them before doing your own investigation, and let each inspect its own area; " +
+			"split work into parallel agents, with separate agents for verification and end-to-end checks. If they need something you are still preparing (a contract, a decision), " +
+			"spawn them anyway to investigate read-only, and send it when ready. Before spawning, check peer_list so the new agent's files and responsibilities don't overlap an active agent's, " +
+			"and state its boundaries in the brief. While agents work, end your turn instead of waiting: their mail starts your next turn.",
 		parameters: z.object({
 			name: z.string().describe("Its name in the swarm, usually its role, e.g. 'reviewer'."),
 			prompt: z
@@ -647,17 +693,19 @@ export default function peerMail(pi: ExtensionAPI) {
 					.filter(peer => peer.hub === membership?.name && peer.kitty?.socket === process.env.KITTY_LISTEN_ON)
 					.flatMap(peer => (peer.kitty ? [peer.kitty.window] : [])),
 			});
+			// The hub should know when the user overrode its choice, so it doesn't misread the agent's model later.
+			const changed = choice.launch !== proposed.launch ? ` The user chose this model at approval instead of your ${proposed.selector} (${proposed.provider}/${proposed.model}).` : "";
 			const on = `${choice.selector} (${choice.provider}/${choice.model})`;
 			const deadline = Date.now() + SPAWN_JOIN_TIMEOUT_MS;
 			while (Date.now() < deadline && !signal?.aborted) {
 				const joined = swarm.spawned(request.id);
 				if (joined) {
-					const text = `Started "${joined.name}" on ${on} in kitty window ${window}. It is working on your prompt and will message you.`;
+					const text = `Started "${joined.name}" on ${on} in kitty window ${window}. It is working on your prompt and will message you.${changed}`;
 					return { content: [{ type: "text", text }], details: { name: joined.name, window, model: choice } };
 				}
 				await Bun.sleep(500);
 			}
-			const text = `Opened kitty window ${window} for ${on}, but the agent hasn't joined the swarm yet; check it with peer_list shortly.`;
+			const text = `Opened kitty window ${window} for ${on}, but the agent hasn't joined the swarm yet; check it with peer_list shortly.${changed}`;
 			return { content: [{ type: "text", text }], details: { name: params.name, window, model: choice } };
 		},
 	});
@@ -711,7 +759,7 @@ export default function peerMail(pi: ExtensionAPI) {
 				ctx.ui.notify(`peer-mail: ${ISOLATED}`, "info");
 				return;
 			}
-			membership.leave();
+			membership.leave("left");
 			await isolate(ctx);
 			ctx.ui.notify("peer-mail: left the swarm; this session is isolated", "info");
 		},

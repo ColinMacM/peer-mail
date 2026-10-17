@@ -5,6 +5,7 @@
  * typed by the sending agent, so it can act on the user's instruction or approval.
  */
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 
 /** Collapse whitespace so line wrapping doesn't decide whether a quote matches. */
 function normalize(text: string): string {
@@ -16,17 +17,23 @@ function textOf(content: string | readonly { type: string; text?: string }[]): s
 	return content.map(part => (part.type === "text" && part.text ? part.text : "")).join("\n");
 }
 
-/** Everything the user said in this session: their own messages and their question-box answers. */
+/**
+ * What the user said in `message`, if it is the user's: a message they sent (prompts an extension
+ * sends for the session, like a spawned agent's task, are attributed to the agent) or an answer
+ * they gave in a question box.
+ */
+export function userSaid(message: AgentMessage): { words: string; how: "said" | "answered" } | undefined {
+	if (message.role === "user" && message.attribution !== "agent") return { words: textOf(message.content), how: "said" };
+	if (message.role === "toolResult" && message.toolName === "ask" && !message.isError) return { words: textOf(message.content), how: "answered" };
+	return undefined;
+}
+
+/** Everything the user said in this session. */
 export function userWords(session: ReadonlySessionManager): string[] {
-	const words: string[] = [];
-	for (const entry of session.getBranch()) {
-		if (entry.type !== "message") continue;
-		const { message } = entry;
-		// Prompts an extension sends for the session (a spawned agent's task) are attributed to the agent.
-		if (message.role === "user" && message.attribution !== "agent") words.push(textOf(message.content));
-		if (message.role === "toolResult" && message.toolName === "ask" && !message.isError) words.push(textOf(message.content));
-	}
-	return words;
+	return session.getBranch().flatMap(entry => {
+		const said = entry.type === "message" ? userSaid(entry.message) : undefined;
+		return said ? [said.words] : [];
+	});
 }
 
 /**

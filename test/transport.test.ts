@@ -176,3 +176,14 @@ test("a finished agent is skipped by broadcasts until mail sent to it by name br
 	expect(lead.send("all", "stop").map(message => message.to).sort()).toEqual(["reviewer", "tester"]);
 	expect(tester.receive().map(message => message.body)).toEqual(["rebase on main", "stop"]);
 });
+
+test("a member whose heartbeat is late is still online while its process runs: after the Mac sleeps every heartbeat is late", () => {
+	const lead = Membership.start(swarm, "s", "lead", "/r");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+	const late = Date.now() + 10 * 60_000;
+	expect(swarm.isOnline(swarm.peer("reviewer")!, late)).toBe(true);
+
+	reviewer.leave("closed");
+	expect(swarm.peer("reviewer")).toMatchObject({ pid: null, leftHow: "closed" });
+	expect(swarm.isOnline(swarm.peer("reviewer")!)).toBe(false);
+});

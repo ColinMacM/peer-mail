@@ -5,7 +5,7 @@
  * lowest used fraction of its usage limits, counting agents already running on it, so a swarm
  * spreads across subscriptions instead of draining one.
  */
-import type { UsageReport } from "@oh-my-pi/pi-ai";
+import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import type { Peer } from "./transport";
@@ -25,11 +25,17 @@ const USAGE_TIMEOUT_MS = 8_000;
 
 export interface Subscription {
 	provider: string;
-	/** Highest used fraction across its usage limits (0..1, >1 is overage); undefined when unreported. */
+	/**
+	 * How used it is (0..1, >1 is overage): the fullest limit every request counts against, or for a
+	 * provider split into separate pools (Cursor) the emptiest pool. Undefined when unreported.
+	 */
 	used?: number;
 	/** Swarm members currently running on it. */
 	agents: number;
+	/** No request can go through: a limit every request counts against is spent, or every pool is. */
 	exhausted: boolean;
+	/** Each limit, e.g. `7 days 47%` or `Other Models exhausted, resets Nov 5`. */
+	limits: string[];
 }
 
 export interface RoleChoice {
@@ -72,7 +78,7 @@ export interface ModelOptions {
  * Providers whose models can't run subagents in omp: Cursor's models start subagents through
  * Cursor's own protocol, which omp answers with "Subagents are not implemented by this client".
  */
-const NO_SUBAGENTS: Record<string, true> = { cursor: true };
+export const NO_SUBAGENTS: Record<string, true> = { cursor: true };
 
 function settingOf(value: unknown): string | undefined {
 	if (typeof value === "string") return value;
@@ -93,18 +99,55 @@ export function configuredRoles(ctx: ExtensionContext, settings: HostSettings): 
 	return roles;
 }
 
-/** Highest used fraction across a report's limits, from whichever amount fields it has. */
-function usedFraction(limits: readonly { amount: { used?: number; limit?: number; usedFraction?: number; remainingFraction?: number; unit: string } }[]): number | undefined {
-	let highest: number | undefined;
-	for (const { amount } of limits) {
-		const fraction =
-			amount.usedFraction ??
-			(amount.used !== undefined && amount.limit ? amount.used / amount.limit : undefined) ??
-			(amount.unit === "percent" && amount.used !== undefined ? amount.used / 100 : undefined) ??
-			(amount.remainingFraction !== undefined ? 1 - amount.remainingFraction : undefined);
-		if (fraction !== undefined && (highest === undefined || fraction > highest)) highest = fraction;
+/** A limit's used fraction, from whichever amount fields it has. */
+function usedFraction(limit: UsageLimit): number | undefined {
+	const { amount } = limit;
+	return (
+		amount.usedFraction ??
+		(amount.used !== undefined && amount.limit ? amount.used / amount.limit : undefined) ??
+		(amount.unit === "percent" && amount.used !== undefined ? amount.used / 100 : undefined) ??
+		(amount.remainingFraction !== undefined ? 1 - amount.remainingFraction : undefined)
+	);
+}
+
+/** `5 hours 100%, resets 21:46`: a limit's use, and when it resets once it's nearly full. */
+function describeLimit(limit: UsageLimit, now: number): string {
+	const used = usedFraction(limit);
+	const spent = limit.status === "exhausted" || (used ?? 0) >= 1;
+	const level = spent ? "exhausted" : used === undefined ? "usage unknown" : `${Math.round(used * 100)}%`;
+	const resetsAt = limit.window?.resetsAt;
+	if (!resetsAt || (!spent && (used ?? 0) < NEARLY_FULL)) return `${limit.label} ${level}`;
+	const date = new Date(resetsAt);
+	const when =
+		resetsAt - now < 24 * 3600_000
+			? date.toTimeString().slice(0, 5)
+			: date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+	return `${limit.label} ${level}, resets ${when}`;
+}
+
+/**
+ * A provider's subscription from its usage report. Limits flagged shared all apply to every request.
+ * Unflagged limits on the same window (Cursor's monthly "Cursor Models" and "Other Models") are
+ * separate pools, alternatives to each other; a lone unflagged limit is treated as shared, the
+ * cautious reading.
+ */
+export function subscriptionOf(provider: string, report: UsageReport | undefined, agents: number, now = Date.now()): Subscription {
+	const limits = report?.limits ?? [];
+	const groups = new Map<string, UsageLimit[]>();
+	for (const limit of limits) {
+		const key = limit.scope?.shared ? `shared:${limit.id}` : `window:${limit.scope?.windowId ?? limit.window?.id ?? limit.id}`;
+		groups.set(key, [...(groups.get(key) ?? []), limit]);
 	}
-	return highest;
+	const spent = (limit: UsageLimit) => limit.status === "exhausted" || (usedFraction(limit) ?? 0) >= 1;
+	// Each group is as used as its emptiest member (a lone limit: itself); the subscription as its fullest group.
+	let used: number | undefined;
+	let exhausted = false;
+	for (const group of groups.values()) {
+		const fractions = group.map(usedFraction).filter((value): value is number => value !== undefined);
+		if (fractions.length > 0) used = Math.max(used ?? 0, Math.min(...fractions));
+		if (group.every(spent)) exhausted = true;
+	}
+	return { provider, used, agents, exhausted, limits: limits.map(limit => describeLimit(limit, now)) };
 }
 
 /** The subscriptions this session can use, with their usage and how many swarm agents run on each. */
@@ -116,16 +159,13 @@ export async function subscriptions(ctx: ExtensionContext, members: Peer[]): Pro
 	} catch {
 		// Usage is advisory: without it, choices balance by agent count alone.
 	}
-	return providers.map(provider => {
-		const report = reports?.find(item => item.provider === provider);
-		const used = report ? usedFraction(report.limits) : undefined;
-		return {
+	return providers.map(provider =>
+		subscriptionOf(
 			provider,
-			used,
-			agents: members.filter(member => member.model?.startsWith(`${provider}/`)).length,
-			exhausted: !!report?.limits.some(limit => limit.status === "exhausted"),
-		};
-	});
+			reports?.find(item => item.provider === provider),
+			members.filter(member => member.model?.startsWith(`${provider}/`)).length,
+		),
+	);
 }
 
 export async function modelOptions(ctx: ExtensionContext, settings: HostSettings, members: Peer[]): Promise<ModelOptions> {
@@ -139,15 +179,13 @@ export function load(subscription: Subscription | undefined): number {
 	return (subscription.used ?? 0) + subscription.agents * AGENT_WEIGHT;
 }
 
+/** `7 days 47%, 5 hours 0%; 2 agents on it`: each limit as reported, then how many swarm agents use it. */
 export function describeSubscription(subscription: Subscription | undefined): string {
 	if (!subscription) return "not available";
-	const used = subscription.exhausted
-		? "exhausted"
-		: subscription.used === undefined
-			? "usage unknown"
-			: `${Math.round(subscription.used * 100)}% used`;
+	const usage = subscription.limits.length > 0 ? subscription.limits.join(", ") : "usage unknown";
+	const state = subscription.exhausted ? "EXHAUSTED: " : "";
 	const agents = subscription.agents === 1 ? "1 agent on it" : `${subscription.agents} agents on it`;
-	return `${used}, ${agents}${NO_SUBAGENTS[subscription.provider] ? ", no subagents" : ""}`;
+	return `${state}${usage}; ${agents}${NO_SUBAGENTS[subscription.provider] ? "; no subagents" : ""}`;
 }
 
 /**

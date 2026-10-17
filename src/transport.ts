@@ -55,8 +55,10 @@ export interface Peer {
 	model?: string;
 	/** What the member was doing at its last heartbeat. */
 	activity?: Activity;
-	/** When the member's session ended (it left or exited); unset while it runs or if it crashed. */
+	/** When the member's session ended; unset while it runs or if its process died without shutting down. */
 	leftAt?: number;
+	/** How it ended: its session was closed (only the user closes agents' sessions), or it left the swarm. */
+	leftHow?: "closed" | "left";
 	/** A short status the member set itself with peer_status. */
 	status?: string;
 	/** Set by the member when its work is done; broadcasts skip it, and mail to it clears it. */
@@ -73,6 +75,8 @@ export interface Activity {
 	/** The tool call's stated intent, when it gave one. */
 	intent?: string;
 	since: number;
+	/** Background jobs it has running (async commands, background subagents). */
+	jobs?: number;
 }
 
 /** A kitty window, and the remote-control socket of the kitty instance that owns it. */
@@ -105,6 +109,8 @@ export interface SendOptions {
 	replyTo?: string;
 	/** The user's own words, verified by the sender's extension against its session (see quote.ts). */
 	user?: string;
+	/** A copy for the record: it joins the recipient's next turn instead of starting or interrupting one. */
+	quiet?: boolean;
 }
 
 export interface Message {
@@ -117,11 +123,15 @@ export interface Message {
 	replyTo?: string;
 	/** The user's own words, quoted verbatim from the sender's session. */
 	user?: string;
+	quiet?: boolean;
 }
 
 /** How often a member refreshes its peers/ entry. */
 export const HEARTBEAT_MS = 5_000;
-/** A member silent for longer than this is offline, whatever its pid says (crashed, or asleep). */
+/**
+ * A member on another machine silent for longer than this is offline. On this machine its pid
+ * decides instead: after the Mac sleeps every member's heartbeat is late, and that isn't leaving.
+ */
 export const STALE_MS = 3 * HEARTBEAT_MS;
 /** Sender name for mail from the command line rather than a member. */
 export const HUMAN = "human";
@@ -233,8 +243,9 @@ export class Swarm {
 	}
 
 	isOnline(peer: Peer, now = Date.now()): boolean {
-		if (peer.pid === null || now - peer.seenAt > STALE_MS) return false;
-		return peer.host !== os.hostname() || pidAlive(peer.pid);
+		if (peer.pid === null) return false;
+		if (peer.host === os.hostname()) return pidAlive(peer.pid);
+		return now - peer.seenAt <= STALE_MS;
 	}
 
 	/**
@@ -320,10 +331,10 @@ export class Swarm {
 	}
 
 	/** Mark a member as gone, keeping its entry so mail can still be addressed to it. */
-	leave(member: Peer): void {
+	leave(member: Peer, how: "closed" | "left"): void {
 		const peer = this.peer(member.name);
 		if (peer && peer.pid === member.pid && peer.phase === member.phase && this.phase()?.id === member.phase) {
-			writeJson(this.path("peers", `${member.name}.json`), { ...peer, pid: null, leftAt: Date.now() });
+			writeJson(this.path("peers", `${member.name}.json`), { ...peer, pid: null, leftAt: Date.now(), leftHow: how });
 		}
 	}
 
@@ -370,7 +381,17 @@ export class Swarm {
 			// process's counter for sends within the same millisecond. Short, since agents quote them.
 			sendCounter += 1;
 			const id = `${sentAt.toString(36).padStart(9, "0")}-${sendCounter.toString(36).padStart(4, "0")}-${randomUUID().slice(0, 4)}`;
-			const message: Message = { id, phase, from, to: recipient, body, sentAt, ...(options.replyTo ? { replyTo: options.replyTo } : {}), ...(options.user ? { user: options.user } : {}) };
+			const message: Message = {
+				id,
+				phase,
+				from,
+				to: recipient,
+				body,
+				sentAt,
+				...(options.replyTo ? { replyTo: options.replyTo } : {}),
+				...(options.user ? { user: options.user } : {}),
+				...(options.quiet ? { quiet: true } : {}),
+			};
 			writeJson(this.path("inbox", recipient, `${id}.json`), message);
 			return message;
 		});

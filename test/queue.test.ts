@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { RunQueue, runsElsewhere } from "../src/queue";
-import { sandboxedCommand, sandboxProfile, sandboxUnavailable } from "../src/sandbox";
+import { sandboxedCommand, sandboxProfile, sandboxScript, sandboxUnavailable } from "../src/sandbox";
 import { pidAlive, writeJson } from "../src/transport";
 
 let root: string;
@@ -12,7 +12,17 @@ beforeEach(() => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "peer-mail-queue-"));
 	queue = new RunQueue(root);
 });
-afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+	// Each test's root gives its own sandbox profile, and with it a script under SANDBOX_DIR.
+	if (sandboxUnavailable() === undefined) {
+		for (const other of [root, path.join(root, "other")]) {
+			const script = sandboxScript(sandboxProfile(other, 7577));
+			fs.rmSync(script, { force: true });
+			fs.rmSync(`${script}.sb`, { force: true });
+		}
+	}
+	fs.rmSync(root, { recursive: true, force: true });
+});
 
 test("runs wait in the order queued, and a dead session's ticket doesn't hold up the line", async () => {
 	writeJson(path.join(queue.dir, "000000000000001-000000000-1.json"), { id: "000000000000001-000000000-1", member: "ghost", pid: 2 ** 22 + 7, command: "x", cwd: root, queuedAt: 1 });
@@ -60,6 +70,12 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 		expect(listen.output).toContain("Operation not permitted");
 		const mailbox = await queue.run({ ...ticket, command: `ls ${root}/swarm` }, profile(), 10_000, undefined);
 		expect(mailbox.exitCode).not.toBe(0);
+		// The wrapper script holds the profile, so a sandboxed command must not be able to rewrite it.
+		const script = sandboxScript(profile());
+		const tamper = await queue.run({ ...ticket, command: `echo 'exec "$@"' > ${script}.sb; echo x >> ${script}` }, profile(), 10_000, undefined);
+		expect(tamper.exitCode).not.toBe(0);
+		expect(sandboxScript(profile())).toBe(script);
+		expect(fs.readFileSync(`${script}.sb`, "utf8")).toBe(profile());
 		const ok = await queue.run({ ...ticket, command: 'echo $((6 * 7)); test -z "$PEER_MAIL_DIR"' }, profile(), 10_000, undefined);
 		expect(ok).toMatchObject({ exitCode: 0, timedOut: false });
 		expect(ok.output).toBe("42\n");

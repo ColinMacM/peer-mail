@@ -58,8 +58,8 @@ export class Membership {
 	}
 
 	/**
-	 * Keep the name alive, recording the model the session runs now. When another session has
-	 * taken the name over (this one was asleep past STALE_MS), join again, possibly under a
+	 * Keep the name alive, recording the model and activity of the session now. When another
+	 * session has taken the name over (this one's entry was lost or rewritten), join again, possibly under a
 	 * suffixed name; returns that name if it changed. Throws StalePhaseError once the swarm has
 	 * been restarted.
 	 */
@@ -97,8 +97,8 @@ export class Membership {
 		this.swarm.setStatus(this.#peer, update);
 	}
 
-	leave(): void {
-		this.swarm.leave(this.#peer);
+	leave(how: "closed" | "left"): void {
+		this.swarm.leave(this.#peer, how);
 	}
 }
 
