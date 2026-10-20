@@ -119,6 +119,8 @@ export class RunQueue {
 	async run(ticket: RunTicket, profile: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<RunResult> {
 		const started = Date.now();
 		const markFile = path.join(this.dir, `${ticket.id}.mark`);
+		// A remote run's ticket was never enqueued, so nothing has made the directory yet.
+		fs.mkdirSync(this.dir, { recursive: true });
 		const mark = fs.openSync(markFile, "w");
 		const child = spawn(sandboxScript(profile), [ticket.command], { cwd: ticket.cwd, detached: true, stdio: ["ignore", "pipe", "pipe", mark] });
 		fs.closeSync(mark);
@@ -161,7 +163,7 @@ export class RunQueue {
 
 /** Kill every process that still holds `markFile` open (ones that left the run's process group). */
 function killMarkHolders(markFile: string): number {
-	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-t", markFile], { stdout: "pipe", stderr: "ignore" });
+	const lsof = Bun.spawnSync([process.platform === "darwin" ? "/usr/sbin/lsof" : "/usr/bin/lsof", "-t", markFile], { stdout: "pipe", stderr: "ignore" });
 	const pids = lsof.stdout
 		.toString()
 		.split("\n")

@@ -100,7 +100,7 @@ Models come from your omp `modelRoles`. A hub's `peer_models` lists them along w
 
 A spawned agent is locked down so it can't set up its own way to reach other agents:
 
-- Its `bash` runs in a macOS sandbox (`sandbox-exec`). Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket or the graph view's port. The kitty and peer-mail environment variables are removed. Outbound network, the repo and everything else work.
+- Its `bash` runs in a sandbox: `sandbox-exec` on macOS, landlock plus a seccomp filter (no `bind` or `listen`) on Linux. Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket. macOS also blocks the graph view's port; Linux does not (a filter that denies one outbound TCP port would deny the rest). The kitty and peer-mail environment variables are removed. Outbound network, the repo and everything else work. Linux needs `python3` on PATH.
 - A sandboxed command reads as `/tmp/peer-mail-<uid>/sandbox-<hash> '<command>'`. The script holds the profile, which used to be spelled out inline in every command. The script directory is private to you, and the sandbox can't write to it.
 - It has no `eval` (kernels can't be sandboxed), and `bash` can't start long-lived services (`name`/`ready`).
 - Its other tools (`read`, `write`, `grep`, …) are refused if their arguments name the peer-mail directory or the sandbox's directory.
@@ -154,7 +154,7 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 | `src/kitty.ts` | kitty remote control: opening a split, focusing a member's window |
 | `src/graph.ts`, `src/graph.html` | the graph view's server and page |
 | `src/models.ts` | your omp roles, subscription usage, and which model a new agent gets |
-| `src/sandbox.ts` | the sandbox profile spawned agents' commands run in |
+| `src/sandbox.ts` | the sandbox (macOS `sandbox-exec`, Linux landlock + seccomp) spawned agents' commands run in |
 | `src/queue.ts` | the run queue: waiting in line, running in the sandbox, killing what a run leaves behind |
 | `src/quote.ts` | checking that a quote is the user's own words before it is relayed |
 | `src/version.ts` | the hash of the plugin code a session loaded |
@@ -167,8 +167,8 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 - Who can message whom is fixed by the graph (vertex ↔ its hub, hub ↔ hub); isolation is by not joining.
 - Spawning and the graph's click-to-open need kitty with a remote-control socket (see above); clicking a member that runs outside kitty only says so.
 - A message from another session is a request, not the user's instruction, unless it carries a verified `user` quote; each member's briefing says so.
-- The sandbox and `peer_run` need macOS; elsewhere a spawned agent's `bash` and `peer_run` are refused.
-- The sandbox closes sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed.
+- The sandbox and `peer_run` need macOS or Linux (Linux: x64 or arm64, and `python3`). Elsewhere a spawned agent's `bash` and `peer_run` are refused.
+- The sandbox closes listening sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed. On Linux the graph view's port is not blocked.
 - A process that leaves a run's process group and also closes the marker file isn't found when the run ends; it stays sandboxed.
 - `omp -p` runs have no slash commands, so they can't join.
 

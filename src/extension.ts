@@ -43,7 +43,7 @@ import {
 } from "./models";
 import { RunQueue, type RunTicket, runsElsewhere } from "./queue";
 import { userSaid, verifiedQuote } from "./quote";
-import { realPath, SANDBOX_DIR, sandboxedCommand, sandboxProfile, sandboxUnavailable } from "./sandbox";
+import { realPath, SANDBOX_DIR, SANDBOXED, sandboxedCommand, sandboxProfile, sandboxScript, sandboxUnavailable } from "./sandbox";
 import { type Activity, BROADCAST, HEARTBEAT_MS, type Message, StalePhaseError, Swarm } from "./transport";
 import { codeVersion } from "./version";
 
@@ -319,7 +319,7 @@ export default function peerMail(pi: ExtensionAPI) {
 						(NO_SUBAGENTS[ctx.models.current()?.provider ?? ""]
 							? "Your model can't run subagents (the task tool); work through it yourself. "
 							: "Use subagents (the task tool) freely to research and investigate in parallel within your scope; your hub doesn't need to approve them. ") +
-						"bash sandboxed: no listening sockets, no mailbox. " +
+						(SANDBOXED ? "bash sandboxed: no listening sockets, no mailbox. " : "bash unsandboxed on this machine: never touch the mailbox or kitty. ") +
 						"peer_run: heavy work on this machine (builds, tests, devices), one at a time. Remote work (ssh): plain bash.",
 					display: true,
 					attribution: "agent",
@@ -361,7 +361,15 @@ export default function peerMail(pi: ExtensionAPI) {
 			}
 			const unavailable = sandboxUnavailable();
 			if (unavailable) return { block: true, reason: unavailable };
-			return { input: { ...event.input, command: sandboxedCommand(event.input.command, sandboxProfile(swarm.root, DEFAULT_GRAPH_PORT)) } };
+			const profile = sandboxProfile(swarm.root, DEFAULT_GRAPH_PORT);
+			// Without sandbox-exec nothing else keeps the command out of the mailbox. The hook can see a
+			// call it already wrapped (subagents share this module), so the wrapper's own path doesn't count.
+			const wrapper = `${sandboxScript(profile)} `;
+			const command = event.input.command.startsWith(wrapper) ? event.input.command.slice(wrapper.length) : event.input.command;
+			if (!SANDBOXED && offLimits.some(dir => command.includes(dir))) {
+				return { block: true, reason: "peer-mail's mailbox and sandbox files are off limits: message your hub with peer_send." };
+			}
+			return { input: { ...event.input, command: sandboxedCommand(event.input.command, profile) } };
 		}
 		// The peer tools are the sanctioned way in; their text may mention the mailbox freely.
 		if (ALL_TOOLS.includes(event.toolName)) return;
@@ -391,6 +399,9 @@ export default function peerMail(pi: ExtensionAPI) {
 			if (!membership) throw new Error(ISOLATED);
 			const unavailable = sandboxUnavailable();
 			if (unavailable) throw new Error(unavailable);
+			if (!SANDBOXED && offLimits.some(dir => params.command.includes(dir) || (params.cwd ?? "").includes(dir))) {
+				throw new Error("peer-mail's mailbox and sandbox files are off limits: message your hub with peer_send.");
+			}
 			// Some models fill every optional field (empty strings, zeros); those mean "not given".
 			const timeout = Math.min(params.timeout && params.timeout > 0 ? params.timeout : RUN_TIMEOUT_DEFAULT_S, RUN_TIMEOUT_MAX_S);
 			const remote = runsElsewhere(params.command);

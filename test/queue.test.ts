@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { RunQueue, runsElsewhere } from "../src/queue";
-import { sandboxedCommand, sandboxProfile, sandboxScript, sandboxUnavailable } from "../src/sandbox";
+import { SANDBOXED, sandboxedCommand, sandboxProfile, sandboxScript, sandboxUnavailable } from "../src/sandbox";
 import { pidAlive, writeJson } from "../src/transport";
 
 let root: string;
@@ -57,7 +57,7 @@ test("a run on another host over ssh takes no place in line, so local runs don't
 describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 	const profile = () => sandboxProfile(root, 7577);
 
-	test("a run can't listen on a socket or reach the mailbox, but works otherwise", async () => {
+	test.skipIf(!SANDBOXED)("a run can't listen on a socket or reach the mailbox, but works otherwise", async () => {
 		fs.mkdirSync(path.join(root, "swarm"), { recursive: true });
 		const ticket = queue.enqueue("a", "", os.tmpdir());
 		const listen = await queue.run(
@@ -108,5 +108,10 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 		const result = await queue.run(ticket, profile(), 300, undefined);
 		expect(result).toMatchObject({ exitCode: null, timedOut: true });
 		expect(result.durationMs).toBeLessThan(5_000);
+	});
+
+	test("a run that took no place in line still runs, though nothing was ever queued", async () => {
+		const result = await queue.run(queue.ticket("a", "echo $((6 * 7))", os.tmpdir()), profile(), 10_000, undefined);
+		expect(result).toMatchObject({ exitCode: 0, output: "42\n" });
 	});
 });
