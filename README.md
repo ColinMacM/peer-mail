@@ -100,8 +100,8 @@ Models come from your omp `modelRoles`. A hub's `peer_models` lists them along w
 
 A spawned agent is locked down so it can't set up its own way to reach other agents:
 
-- Its `bash` runs in a sandbox: `sandbox-exec` on macOS, landlock plus a seccomp filter (no `bind` or `listen`) on Linux. Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket. macOS also blocks the graph view's port; Linux does not (a filter that denies one outbound TCP port would deny the rest). The kitty and peer-mail environment variables are removed. Outbound network, the repo and everything else work. Linux needs `python3` on PATH.
-- A sandboxed command reads as `/tmp/peer-mail-<uid>/sandbox-<hash> '<command>'`. The script holds the profile, which used to be spelled out inline in every command. The script directory is private to you, and the sandbox can't write to it.
+- Its `bash` runs in a sandbox: `sandbox-exec` on macOS, landlock plus a seccomp filter (no `bind` or `listen`) on Linux. Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket (on Linux only where unprivileged user namespaces are allowed; see below). macOS also blocks the graph view's port; Linux does not (a filter that denies one outbound TCP port would deny the rest). The kitty and peer-mail environment variables are removed. Outbound network, the repo and everything else work. Linux needs `python3` on PATH.
+- A sandboxed command reads as `<dir>/sandbox-<hash> '<command>'`, with `<dir>` = `/tmp/peer-mail-<uid>` on macOS and `~/.omp/peer-mail-sandbox-<uid>` on Linux. The script holds the profile, which used to be spelled out inline in every command. The script directory is private to you, and the sandbox can't write to it.
 - It has no `eval` (kernels can't be sandboxed), and `bash` can't start long-lived services (`name`/`ready`).
 - Its other tools (`read`, `write`, `grep`, …) are refused if their arguments name the peer-mail directory or the sandbox's directory.
 - Its subagents are held to the same rules.
@@ -169,6 +169,7 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 - A message from another session is a request, not the user's instruction, unless it carries a verified `user` quote; each member's briefing says so.
 - The sandbox and `peer_run` need macOS or Linux (Linux: x64 or arm64, and `python3`). Elsewhere a spawned agent's `bash` and `peer_run` are refused.
 - The sandbox closes listening sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed. On Linux the graph view's port is not blocked.
+- Linux landlock can only grant access, so the directories on the way down to the mailbox and the script directory (`/`, `/home`, `~`, `~/.omp`) are list-only inside a command: nothing new can be created directly in them, and mailbox file names can be listed (not read). Entries created there later are usable from the next command on. Landlock can't stop a connect to a unix socket either, so kitty's socket is closed only when the private mount namespace is available; Ubuntu's AppArmor restriction on unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`) leaves it reachable.
 - A process that leaves a run's process group and also closes the marker file isn't found when the run ends; it stays sandboxed.
 - `omp -p` runs have no slash commands, so they can't join.
 

@@ -59,6 +59,7 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 
 	test.skipIf(!SANDBOXED)("a run can't listen on a socket or reach the mailbox, but works otherwise", async () => {
 		fs.mkdirSync(path.join(root, "swarm"), { recursive: true });
+		fs.writeFileSync(path.join(root, "swarm", "message.json"), "{}\n");
 		const ticket = queue.enqueue("a", "", os.tmpdir());
 		const listen = await queue.run(
 			{ ...ticket, command: `python3 -c "import socket; socket.socket().bind(('127.0.0.1', 0))"` },
@@ -68,8 +69,12 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 		);
 		expect(listen.exitCode).not.toBe(0);
 		expect(listen.output).toContain("Operation not permitted");
-		const mailbox = await queue.run({ ...ticket, command: `ls ${root}/swarm` }, profile(), 10_000, undefined);
-		expect(mailbox.exitCode).not.toBe(0);
+		// Reading a message or dropping one in are what matter; on Linux the names can still be listed.
+		const read = await queue.run({ ...ticket, command: `cat ${root}/swarm/message.json` }, profile(), 10_000, undefined);
+		expect(read.exitCode).not.toBe(0);
+		const drop = await queue.run({ ...ticket, command: `echo '{}' > ${root}/swarm/forged.json` }, profile(), 10_000, undefined);
+		expect(drop.exitCode).not.toBe(0);
+		expect(fs.existsSync(path.join(root, "swarm", "forged.json"))).toBe(false);
 		// The wrapper script holds the profile, so a sandboxed command must not be able to rewrite it.
 		const script = sandboxScript(profile());
 		const tamper = await queue.run({ ...ticket, command: `echo 'exec "$@"' > ${script}.sb; echo x >> ${script}` }, profile(), 10_000, undefined);
@@ -91,7 +96,9 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 	});
 
 	test("nothing a run starts outlives it, even a process that left its group", async () => {
-		const pidFile = path.join(os.tmpdir(), `peer-mail-escapee-${process.pid}`);
+		// Not directly in the temp dir: on Linux the mailbox root sits there, which leaves it list-only.
+		const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "peer-mail-escapee-"));
+		const pidFile = path.join(scratch, "pid");
 		const escape = `python3 -c "import os,time; os.fork() and os._exit(0); os.setsid(); os.fork() and os._exit(0); open('${pidFile}','w').write(str(os.getpid())); time.sleep(60)"`;
 		const ticket = queue.enqueue("a", `${escape}; sleep 60 & echo started`, os.tmpdir());
 		const result = await queue.run(ticket, profile(), 10_000, undefined);
@@ -100,7 +107,7 @@ describe.skipIf(sandboxUnavailable() !== undefined)("sandboxed runs", () => {
 		// The escapee is SIGKILLed synchronously, but launchd reaps it on its own schedule; there's no event to await.
 		await Bun.sleep(100);
 		expect(pidAlive(Number(fs.readFileSync(pidFile, "utf8")))).toBe(false);
-		fs.rmSync(pidFile, { force: true });
+		fs.rmSync(scratch, { recursive: true, force: true });
 	});
 
 	test("a run past its timeout is killed", async () => {

@@ -6,18 +6,25 @@
  * everything else work as usual.
  *
  * macOS uses sandbox-exec, which also blocks outbound connections to the graph view's port.
- * Linux uses landlock (mailbox unreadable and unwritable, sandbox directory read-only) and a
- * seccomp filter that rejects bind and listen. When unprivileged user namespaces are allowed,
- * the same paths are also covered with a private mount namespace (tmpfs over the mailbox,
- * read-only bind of the sandbox directory, /dev/null over kitty's socket). Linux cannot deny a
- * single outbound TCP port without also denying other outbound connects, so the graph port stays
+ * Linux uses landlock and a seccomp filter that rejects bind and listen. Landlock only grants, so
+ * the helper grants everything except the protected paths: each directory on the way down to the
+ * mailbox or the sandbox directory gets listing only, each of its other entries full access, the
+ * mailbox nothing and the sandbox directory read-only. The cost: within one command, nothing new
+ * can be created directly in those directories (/, /home, ~, ~/.omp, ~/.omp/peer-mail); entries
+ * created later are covered from the next command on. Mailbox file names can be listed, not read.
+ * Landlock can't stop a connect to a unix socket, so kitty's socket is closed only when unprivileged
+ * user namespaces are allowed: then a private mount namespace also puts tmpfs over the mailbox,
+ * a read-only bind over the sandbox directory and /dev/null over kitty's socket. Ubuntu's AppArmor
+ * restriction on user namespaces leaves only landlock and seccomp. Linux cannot deny a single
+ * outbound TCP port without also denying other outbound connects, so the graph port stays
  * reachable there.
  *
- * A command runs as `/tmp/peer-mail-<uid>/sandbox-<hash> '<command>'`: a small script holding the
+ * A command runs as `<SANDBOX_DIR>/sandbox-<hash> '<command>'`: a small script holding the
  * profile, so a sandboxed call reads as the command itself instead of the whole profile inline.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
@@ -25,8 +32,15 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 export const SANDBOXED = process.platform === "darwin" || process.platform === "linux";
 /** Variables that point at the swarm or at kitty; a sandboxed command doesn't get them. */
 const SWARM_ENV = ["KITTY_LISTEN_ON", "KITTY_WINDOW_ID", "KITTY_PID", "PEER_MAIL_DIR", "PEER_MAIL_SPAWN", "PEER_MAIL_NAME"];
-/** Where the sandbox scripts and profiles live: this user's, and read-only from inside the sandbox. */
-export const SANDBOX_DIR = `/tmp/peer-mail-${process.getuid?.() ?? "user"}`;
+/**
+ * Where the sandbox scripts and profiles live: this user's, and read-only from inside the sandbox.
+ * On Linux it sits beside the mailbox, not in /tmp: landlock can only make it read-only by taking
+ * creation rights away from its parent, and /tmp has to stay writable.
+ */
+export const SANDBOX_DIR =
+	process.platform === "linux"
+		? path.join(os.homedir(), ".omp", `peer-mail-sandbox-${process.getuid?.() ?? "user"}`)
+		: `/tmp/peer-mail-${process.getuid?.() ?? "user"}`;
 
 /** seccomp(2) and bind/listen numbers the Linux helper installs. Same on every kernel of that arch. */
 const LINUX_SYSCALLS: Record<string, { seccomp: number; bind: number; listen: number }> = {
@@ -138,6 +152,7 @@ const LINUX_HELPER = String.raw`#!/usr/bin/env python3
 import ctypes
 import json
 import os
+import stat
 import sys
 
 # Landlock file rights, oldest ABI first. A rule has to grant something, so a directory we
@@ -227,18 +242,41 @@ def mount(source: bytes | None, target: str, fstype: bytes | None, flags: int, d
         raise OSError(err, os.strerror(err), target)
 
 
-def try_hide(policy: dict) -> None:
-    """Mount namespace over the mailbox, sandbox dir and kitty sockets. Skip when user namespaces are off."""
+def enter_user_namespace() -> bool:
+    """Map this user to root in a new user namespace; False when unshare itself is refused."""
+    uid, gid = os.getuid(), os.getgid()  # Before unshare: inside, unmapped ids read as nobody.
     if libc.unshare(CLONE_NEWUSER) != 0:
+        return False
+    with open("/proc/self/setgroups", "w") as handle:
+        handle.write("deny")
+    with open("/proc/self/uid_map", "w") as handle:
+        handle.write(f"0 {uid} 1\n")
+    with open("/proc/self/gid_map", "w") as handle:
+        handle.write(f"0 {gid} 1\n")
+    return True
+
+
+def user_namespaces_usable() -> bool:
+    """Try the mapping in a throwaway child first. Ubuntu's AppArmor restriction lets unshare succeed
+    but refuses the maps, and a failed attempt here would leave this process running as nobody."""
+    child = os.fork()
+    if child == 0:
+        try:
+            os._exit(0 if enter_user_namespace() else 1)
+        except OSError:
+            os._exit(1)
+    _, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status) == 0
+
+
+def try_hide(policy: dict) -> None:
+    """Mount namespace over the mailbox, sandbox dir and kitty sockets. Skipped where user namespaces
+    are unavailable; landlock still keeps the mailbox and the sandbox directory closed."""
+    if not user_namespaces_usable():
         return
     try:
-        with open("/proc/self/setgroups", "w") as handle:
-            handle.write("deny")
-        uid, gid = os.getuid(), os.getgid()
-        with open("/proc/self/uid_map", "w") as handle:
-            handle.write(f"0 {uid} 1\n")
-        with open("/proc/self/gid_map", "w") as handle:
-            handle.write(f"0 {gid} 1\n")
+        if not enter_user_namespace():
+            return
         if libc.unshare(CLONE_NEWNS) != 0:
             fail("peer-mail sandbox: could not create a mount namespace after entering a user namespace.")
         mount(None, "/", None, MS_REC | MS_PRIVATE)
@@ -256,6 +294,10 @@ def try_hide(policy: dict) -> None:
         fail(f"peer-mail sandbox: mount isolation failed ({error}).")
 
 
+# The rights landlock accepts on something that isn't a directory.
+FS_FILE = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE | FS_IOCTL_DEV
+
+
 def landlock(policy: dict) -> None:
     try:
         abi = syscall(NR_CREATE, None, 0, LANDLOCK_CREATE_RULESET_VERSION)
@@ -271,27 +313,55 @@ def landlock(policy: dict) -> None:
         fail(f"peer-mail sandbox: landlock_create_ruleset failed ({error}).")
 
     def allow(path: str, access: int) -> None:
-        if not os.path.exists(path):
-            return
-        flags = os.O_PATH | getattr(os, "O_CLOEXEC", 0)
+        # O_NOFOLLOW: a symlink is never granted; what it points at is governed by its own path.
         try:
-            fd = os.open(path, flags)
+            fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError:
             return
-        rule = PathBeneath(access & handled, fd)
         try:
-            syscall(NR_ADD, ruleset, LANDLOCK_RULE_PATH_BENEATH, ctypes.byref(rule), 0)
+            mode = os.fstat(fd).st_mode
+            if stat.S_ISLNK(mode):
+                return
+            if not stat.S_ISDIR(mode):
+                access &= FS_FILE
+            rule = PathBeneath(access & handled, fd)
+            if rule.allowed_access:
+                syscall(NR_ADD, ruleset, LANDLOCK_RULE_PATH_BENEATH, ctypes.byref(rule), 0)
         except OSError as error:
             fail(f"peer-mail sandbox: landlock rule for {path} failed ({error}).")
         finally:
             os.close(fd)
 
-    allow("/", handled)
-    # MAKE_BLOCK is a non-empty grant that still denies read, write and listing.
-    for directory in policy["deny"] + policy["sockets"]:
-        allow(directory, FS_MAKE_BLOCK if handled & FS_MAKE_BLOCK else FS_MAKE_CHAR)
-    for directory in policy["readonly"]:
-        allow(directory, FS_READ)
+    # Landlock only grants, and a grant on a directory covers everything beneath it. So nothing on
+    # the way down to a protected path may get more than listing; every other entry there gets all.
+    deny = {os.path.realpath(p) for p in policy["deny"]}
+    readonly = {os.path.realpath(p) for p in policy["readonly"]}
+    protected = deny | readonly
+
+    def above(directory: str) -> bool:
+        return any(p != directory and os.path.commonpath([p, directory]) == directory for p in protected)
+
+    def cover(directory: str) -> None:
+        if directory in deny:
+            return
+        if directory in readonly:
+            allow(directory, FS_READ)
+            return
+        if not above(directory):
+            allow(directory, handled)
+            return
+        allow(directory, FS_READ_DIR)
+        try:
+            entries = os.listdir(directory)
+        except OSError as error:
+            fail(f"peer-mail sandbox: cannot list {directory} ({error}).")
+        for name in entries:
+            cover(os.path.join(directory, name))
+
+    cover("/")
+    # Unprivileged landlock_restrict_self requires no_new_privs (seccomp sets it too, later).
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        fail("peer-mail sandbox: PR_SET_NO_NEW_PRIVS failed.")
     try:
         syscall(NR_RESTRICT, ruleset, 0)
     except OSError as error:
