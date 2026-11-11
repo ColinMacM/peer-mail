@@ -1,0 +1,266 @@
+Screen {
+    background: $background;
+}
+
+#top {
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+}
+
+#brand {
+    width: auto;
+    color: $accent;
+    text-style: bold;
+    padding-right: 2;
+}
+
+#source {
+    width: 1fr;
+    color: $foreground;
+    text-style: bold;
+}
+
+#status {
+    width: auto;
+    color: $primary;
+}
+
+/* After a request went to the agent: what was sent, until its new version arrives. */
+#banner {
+    display: none;
+    height: auto;
+    padding: 0 2;
+    background: $success 25%;
+    color: $foreground;
+    text-style: bold;
+}
+
+#banner.-warn {
+    background: $warning 25%;
+}
+
+/* A document block a note was sent about, until the agent's new version arrives. */
+.requested {
+    border-left: thick $warning;
+}
+
+#body {
+    padding: 1 2;
+    background: $background;
+    /* A diagram wider than the pane scrolls sideways instead of being cut. */
+    overflow-x: auto;
+}
+
+/* Textual hides fence scrollbars; show one when a diagram or code line overflows. */
+MarkdownFence {
+    overflow-x: auto;
+    scrollbar-size-horizontal: 1;
+}
+
+DocumentView {
+    background: $background;
+}
+
+DiagramView {
+    width: auto;
+    padding: 1 0;
+}
+
+ThemePicker {
+    align: center middle;
+    background: $background 40%;
+}
+
+#picker {
+    width: 38;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#picker-title {
+    color: $accent;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+#picker OptionList {
+    height: auto;
+    border: none;
+    background: $surface;
+}
+
+#picker-hint {
+    color: $text-muted;
+    padding-top: 1;
+}
+
+/* Start screen: shown until the first send. */
+StartView {
+    height: auto;
+    padding: 1 0;
+}
+
+.start-title {
+    color: $accent;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+.start-row {
+    height: auto;
+}
+
+.start-name {
+    width: 9;
+    color: $text-muted;
+}
+
+.start-value {
+    width: 1fr;
+    text-style: bold;
+}
+
+.start-actions {
+    height: auto;
+    padding-top: 1;
+}
+
+.start-action {
+    height: auto;
+}
+
+.start-action:hover {
+    background: $boost;
+}
+
+.start-key {
+    width: 4;
+    color: $accent;
+    text-style: bold;
+}
+
+.start-does {
+    width: 1fr;
+}
+
+.start-hint {
+    color: $text-muted;
+    padding-top: 1;
+}
+
+FilePicker {
+    align: center middle;
+    background: $background 40%;
+}
+
+#files {
+    width: 90%;
+    max-width: 64;
+    height: auto;
+    max-height: 80%;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#files-top {
+    height: 1;
+    margin-bottom: 1;
+}
+
+#files-title {
+    width: auto;
+    color: $accent;
+    text-style: bold;
+    padding-right: 2;
+}
+
+#files-folder {
+    width: 1fr;
+    color: $text-muted;
+}
+
+#files-status {
+    color: $text-muted;
+}
+
+#files-list {
+    height: auto;
+    max-height: 20;
+    border: none;
+    background: $surface;
+}
+
+#files-hint {
+    color: $text-muted;
+    padding-top: 1;
+}
+
+AgentPicker {
+    align: center middle;
+    background: $background 40%;
+}
+
+#agents {
+    width: 60;
+    max-width: 90%;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#agents-title {
+    color: $accent;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+#agents OptionList {
+    height: auto;
+    border: none;
+    background: $surface;
+}
+
+#agents-hint {
+    color: $text-muted;
+    padding-top: 1;
+}
+
+/* Point mode: the selected document block, and the note line. */
+.pointed {
+    background: $accent 30%;
+}
+
+NoteLine {
+    dock: bottom;
+    margin: 0 1;
+}
+
+/* The swarm view: what a box stands for, over the drawing. */
+SwarmDetail {
+    align: center middle;
+    background: $background 40%;
+}
+
+#detail {
+    width: 90%;
+    height: 80%;
+    border: round $primary;
+    background: $surface;
+    padding: 0 1;
+}
+
+#detail Markdown {
+    background: $surface;
+}
+
+#detail-hint {
+    width: 90%;
+    color: $text-muted;
+    background: $surface;
+    padding: 0 2;
+}

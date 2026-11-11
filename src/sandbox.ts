@@ -1,9 +1,10 @@
 /**
  * The sandbox a spawned agent's commands run in, so it can't set up its own way of talking to
  * other agents. Inside it nothing can listen on a socket (TCP, UDP or unix), read or write the
- * peer-mail directory (so neither the mailbox files nor the peer-mail CLI work), drive kitty over
- * its remote-control socket, or change the sandbox itself. Outbound network, the repo and
- * everything else work as usual.
+ * peer-mail directory (so neither the mailbox files nor the peer-mail CLI work), drive kitty or
+ * herdr over their sockets (herdr could type into the hub's pane), or change the sandbox itself.
+ * Outbound network, the repo and everything else work as usual; herdr's SSH agent socket stays
+ * reachable, so ssh still authenticates.
  *
  * macOS uses sandbox-exec, which also blocks outbound connections to the graph view's port.
  * Linux uses landlock and a seccomp filter that rejects bind and listen. Landlock only grants, so
@@ -12,10 +13,10 @@
  * mailbox nothing and the sandbox directory read-only. The cost: within one command, nothing new
  * can be created directly in those directories (/, /home, ~, ~/.omp, ~/.omp/peer-mail); entries
  * created later are covered from the next command on. Mailbox file names can be listed, not read.
- * Landlock can't stop a connect to a unix socket, so kitty's socket is closed only when unprivileged
- * user namespaces are allowed: then a private mount namespace also puts tmpfs over the mailbox,
- * a read-only bind over the sandbox directory and /dev/null over kitty's socket. Ubuntu's AppArmor
- * restriction on user namespaces leaves only landlock and seccomp. Linux cannot deny a single
+ * Landlock can't stop a connect to a unix socket, so kitty's and herdr's sockets are closed only when
+ * unprivileged user namespaces are allowed: then a private mount namespace also puts tmpfs over the
+ * mailbox, a read-only bind over the sandbox directory and /dev/null over those sockets. Ubuntu's
+ * AppArmor restriction on user namespaces leaves only landlock and seccomp. Linux cannot deny a single
  * outbound TCP port without also denying other outbound connects, so the graph port stays
  * reachable there.
  *
@@ -30,8 +31,22 @@ import path from "node:path";
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 /** Whether this machine can run the sandbox (macOS or Linux). */
 export const SANDBOXED = process.platform === "darwin" || process.platform === "linux";
-/** Variables that point at the swarm or at kitty; a sandboxed command doesn't get them. */
-const SWARM_ENV = ["KITTY_LISTEN_ON", "KITTY_WINDOW_ID", "KITTY_PID", "PEER_MAIL_DIR", "PEER_MAIL_SPAWN", "PEER_MAIL_NAME"];
+/** Variables that point at the swarm, kitty or herdr; a sandboxed command doesn't get them. */
+const SWARM_ENV = [
+	"KITTY_LISTEN_ON",
+	"KITTY_WINDOW_ID",
+	"KITTY_PID",
+	"HERDR_ENV",
+	"HERDR_SOCKET_PATH",
+	"HERDR_BIN_PATH",
+	"HERDR_PANE_ID",
+	"HERDR_TAB_ID",
+	"HERDR_WORKSPACE_ID",
+	"PEER_MAIL_DIR",
+	"PEER_MAIL_SPAWN",
+	"PEER_MAIL_NAME",
+	"PEER_MAIL_HERDR_AGENT",
+];
 /**
  * Where the sandbox scripts and profiles live: this user's, and read-only from inside the sandbox.
  * On Linux it sits beside the mailbox, not in /tmp: landlock can only make it read-only by taking
@@ -98,12 +113,20 @@ function kittySocket(): string | undefined {
 	return kitty ? realPath(kitty) : undefined;
 }
 
+/** herdr's API sockets: this session's server's, and the default server's and its client's. */
+function herdrSockets(): string[] {
+	const config = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "herdr");
+	const sockets = [path.join(config, "herdr.sock"), path.join(config, "herdr-client.sock")];
+	if (process.env.HERDR_SOCKET_PATH) sockets.push(process.env.HERDR_SOCKET_PATH);
+	return [...new Set(sockets.map(realPath))];
+}
+
 /** Paths and syscall numbers the Linux helper enforces. `graphPort` is recorded for the macOS profile's counterpart; Linux does not filter it. */
 export function linuxPolicy(mailRoot: string, graphPort: number): LinuxPolicy {
 	const syscalls = LINUX_SYSCALLS[process.arch] ?? LINUX_SYSCALLS.x64;
 	const sockets = ["/tmp", "/private/tmp"]
 		.map(dir => path.join(realPath(dir), "kitty"))
-		.concat(kittySocket() ? [kittySocket()!] : []);
+		.concat(kittySocket() ? [kittySocket()!] : [], herdrSockets());
 	return {
 		deny: [realPath(mailRoot)],
 		readonly: [realPath(SANDBOX_DIR)],
@@ -127,7 +150,9 @@ function darwinProfile(mailRoot: string, graphPort: number): string {
 		'(deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/kitty")))',
 	];
 	const kitty = kittySocket();
-	if (kitty) rules.push(`(deny network-outbound (remote unix-socket (path-literal ${JSON.stringify(kitty)})))`);
+	for (const socket of kitty ? [kitty, ...herdrSockets()] : herdrSockets()) {
+		rules.push(`(deny network-outbound (remote unix-socket (path-literal ${JSON.stringify(socket)})))`);
+	}
 	return rules.join("\n");
 }
 

@@ -1,0 +1,14 @@
+id = "peer-mail.view"
+name = "Swarm view"
+version = "0.2.0"
+min_herdr_version = "0.9.3"
+description = "A peer-mail hub's agents and plan, live, beside the hub (Blueprint, view/)"
+platforms = ["macos", "linux"]
+
+# Opened by the hub (src/herdr.ts openViewPane) with PEER_MAIL_VIEW set to its record file and
+# BLUEPRINT_SOURCE_PANE to the hub's pane. Needs `uv sync` in view/ once (see README).
+[[panes]]
+id = "view"
+title = "Swarm"
+placement = "split"
+command = ["uv", "run", "--project", "view", "--no-sync", "python", "-m", "herdr_blueprint", "swarm"]

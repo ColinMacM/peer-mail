@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Membership } from "../src/inbox";
-import { StalePhaseError, Swarm } from "../src/transport";
+import { StalePhaseError, Swarm, taskDone } from "../src/transport";
 
 let root: string;
 let swarm: Swarm;
@@ -105,9 +105,9 @@ test("renaming to a role brings waiting mail along and frees the old name", () =
 test("a vertex reaches only its hub; a hub reaches its vertices and other hubs, not their vertices", () => {
 	const lead = Membership.start(swarm, "s", "lead", "/r");
 	const other = Membership.attach(swarm, "other", "/o");
-	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
-	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test"), "/r");
-	const helper = Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help"), "/o");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
+	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test", []), "/r");
+	const helper = Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help", []), "/o");
 
 	const names = (member: Membership) => swarm.reachable(member.name).map(peer => peer.name).sort();
 	expect(names(reviewer)).toEqual(["lead"]);
@@ -121,7 +121,7 @@ test("a vertex reaches only its hub; a hub reaches its vertices and other hubs, 
 
 test("a spawn request is used once and finds the member that joined for it", () => {
 	const lead = Membership.start(swarm, "s", "lead", "/r");
-	const request = swarm.requestSpawn(lead.peer, "reviewer", "review the diff");
+	const request = swarm.requestSpawn(lead.peer, "reviewer", "review the diff", []);
 	expect(swarm.spawned(request.id)).toBeUndefined();
 
 	const taken = swarm.takeSpawn(request.id)!;
@@ -133,14 +133,14 @@ test("a spawn request is used once and finds the member that joined for it", () 
 
 test("/startswarm throws away spawn requests that haven't been taken", () => {
 	const lead = Membership.start(swarm, "first", "lead", "/r");
-	const request = swarm.requestSpawn(lead.peer, "reviewer", "review");
+	const request = swarm.requestSpawn(lead.peer, "reviewer", "review", []);
 	Membership.start(new Swarm(root), "second", "lead", "/r");
 	expect(swarm.takeSpawn(request.id)).toBeUndefined();
 });
 
 test("a hub that renames itself keeps its vertices", () => {
 	const lead = Membership.start(swarm, "s", "agent", "/r");
-	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
 
 	lead.rename("lead");
 	expect(reviewer.hub).toBe("lead");
@@ -148,12 +148,25 @@ test("a hub that renames itself keeps its vertices", () => {
 	expect(swarm.reachable("lead").map(peer => peer.name)).toEqual(["reviewer"]);
 });
 
+test("renames keep the plan: a hub keeps its plan, an agent keeps its tasks and steps", () => {
+	const lead = Membership.start(swarm, "s", "agent", "/r");
+	swarm.setPlan(lead.peer, [{ id: "t1", title: "review", agent: "reviewer" }, { id: "t2", title: "merge" }]);
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", ["t1"]), "/r");
+	swarm.setSteps(reviewer.peer, "t1", [{ id: "s1", title: "read diff", done: true }]);
+
+	lead.rename("lead");
+	reviewer.rename("critic");
+	expect(swarm.plan("lead").map(task => `${task.id}:${task.agent ?? "-"}`)).toEqual(["t1:critic", "t2:-"]);
+	expect(swarm.steps("critic")).toEqual({ t1: [{ id: "s1", title: "read diff", done: true }] });
+	expect(taskDone(swarm.plan("lead")[0], swarm.steps("critic").t1)).toBe(true);
+});
+
 test("the graph view draws exactly the edges mail can travel", async () => {
 	const { graphState } = await import("../src/graph");
 	const lead = Membership.start(swarm, "s", "lead", "/r");
 	const other = Membership.attach(swarm, "other", "/o");
-	Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
-	Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help"), "/o");
+	Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
+	Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help", []), "/o");
 
 	const edges = graphState(swarm).edges.map(edge => [...edge].sort().join("-")).sort();
 	const reachable = swarm
@@ -165,8 +178,8 @@ test("the graph view draws exactly the edges mail can travel", async () => {
 
 test("a finished agent is skipped by broadcasts until mail sent to it by name brings it back", () => {
 	const lead = Membership.start(swarm, "s", "lead", "/r");
-	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
-	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test"), "/r");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
+	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test", []), "/r");
 	reviewer.setStatus({ status: "review done", finished: true });
 
 	expect(lead.send("all", "rebase on main").map(message => message.to)).toEqual(["tester"]);
@@ -179,7 +192,7 @@ test("a finished agent is skipped by broadcasts until mail sent to it by name br
 
 test("a member whose heartbeat is late is still online while its process runs: after the Mac sleeps every heartbeat is late", () => {
 	const lead = Membership.start(swarm, "s", "lead", "/r");
-	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review"), "/r");
+	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
 	const late = Date.now() + 10 * 60_000;
 	expect(swarm.isOnline(swarm.peer("reviewer")!, late)).toBe(true);
 

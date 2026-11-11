@@ -23,6 +23,8 @@ There is one swarm at a time. Roles go in the prompt:
 
 Members get `peer_list`, `peer_send`, `peer_rename` and `peer_status`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members that aren't finished.
 
+The peer tools load as ordinary top-level tools (`loadMode: "essential"`), not as discoverable `xd://` devices: models whose harness can't write to `xd://` paths (grok through Cursor) could otherwise not call them at all.
+
 How mail lands depends on who receives it:
 
 - **A hub is never interrupted.** Mail to it arrives between its steps (after the tools in flight finish), or starts a turn when it is idle. Its question boxes, commands, subagents and background jobs are left alone.
@@ -48,7 +50,7 @@ Spawned agents are told to use subagents freely for research and parallel invest
 
 **Relaying your words.** When an agent needs your instruction or approval, the hub passes it on with `peer_send`'s `user_quote`: your exact words, copied from a message you sent it or an answer you gave in a question box. peer-mail checks the quote against the sender's own session and passes it on only if you really said it there. Otherwise the quote is dropped, the message still goes without it, and the sender is told why. Messages you typed count, as do question-box answers; prompts a hub wrote for a spawned agent, tool output and the agent's own text don't. The recipient gets it as `"user":"…"` in the header and is told it's your instruction. Blank optional fields (`user_quote: ""`, `reply_to: ""`, `timeout: 0`, an empty `model` or `status`), which some models send for every field they could leave out, count as not given.
 
-**Status and finished.** `peer_status` lets an agent post a few words about what it's on, and mark itself finished, without messaging anyone. `peer_list` shows it, and broadcasts skip finished agents. Mail sent to a finished agent by name makes it unfinished again.
+**Status and finished.** `peer_status` lets an agent post a few words about what it's on, and mark itself finished, without messaging anyone. `peer_list` shows it, and broadcasts skip finished agents. Mail sent to a finished agent by name makes it unfinished again. An agent with plan tasks can't mark itself finished until each of them is done (see below).
 
 A hub hears once when one of its agents goes offline: `{"offline":"tester","why":"the user closed its session","finished":false,"last":"running bash: Run tests","unread":0}`. Agents never close their own sessions, so the briefing tells the hub that an offline agent hasn't necessarily finished its work: if work remains, it asks you or spawns a replacement with the full brief. Other values of `why`: `it left the swarm` (`/swarm-leave`), or `its process died without shutting down (killed or crashed)`. A notice about an agent that had set `finished` is quiet: it joins the hub's next turn instead of starting one.
 
@@ -64,7 +66,7 @@ When you talk to a spawned agent in its own window, by typing to it or answering
 
 ## Hubs and spawned agents
 
-Sessions you join by hand (`/startswarm`, `/swarm`) are hubs. A hub also gets `peer_spawn`, which opens a kitty split beside it running a new omp session; that session joins the swarm as one of the hub's agents (a vertex) and starts on the prompt the hub gave it:
+Sessions you join by hand (`/startswarm`, `/swarm`) are hubs. A hub also gets `peer_spawn`, which opens a new omp session (in herdr, a pane of the swarm's own workspace; otherwise a kitty split beside the hub); that session joins the swarm as one of the hub's agents (a vertex) and starts on the prompt the hub gave it:
 
 ```text
 /startswarm [fix_robot] You are the lead. Spawn a reviewer to check src/arm.rs and tell me what it finds.
@@ -80,7 +82,15 @@ graph LR
 
 Messages follow the edges: a vertex can message only its hub, and a hub can message its own vertices and the other hubs (`human`, from the shell, can message anyone). Spawned agents can't spawn. If a hub renames itself, its vertices follow.
 
-`peer_spawn` needs omp running in kitty with remote control over a socket. Add these to `~/.config/kitty/kitty.conf`, then quit kitty completely and start it again:
+### In herdr
+
+A hub running in a herdr pane (`HERDR_ENV=1`) leaves its own tab alone. The first spawn creates a workspace labelled `<swarm label> · <hub>`, without taking focus. Each later spawn splits the largest pane there along its longer side (`split`: `vertical` side by side, `horizontal` stacked), so the workspace fills as a grid; when no pane can be halved into two of at least 60 columns or 12 rows, the agent gets a new tab in that workspace. Spawns are placed one at a time, so several started at once share the one workspace. If you close the workspace, the next spawn makes a new one.
+
+omp starts through `herdr agent start --kind omp` and is named after the member (`plan.v2` becomes `plan-v2`, `-2` is added when the name is taken on that herdr server), so herdr's sidebar shows each agent's working, idle or blocked state and the name follows the agent if you move its pane. A spawned agent starts on its task at once and herdr rarely sees it idle, so `agent start` gives up waiting after 10 s; the pane is then named once herdr finds omp in it. The member's entry records its herdr pane, agent name and server socket.
+
+### In kitty
+
+`peer_spawn` outside herdr needs omp running in kitty with remote control over a socket. Add these to `~/.config/kitty/kitty.conf`, then quit kitty completely and start it again:
 
 ```text
 allow_remote_control yes
@@ -92,6 +102,30 @@ The split goes in the hub's tab: kitty splits the largest of the hub's window an
 
 Every spawn asks you first, and you pick the model there. The dialog shows the task and one option per omp role (`Start on @smol`, `Start on @plan`, …). Each option shows its model and how much of that subscription is used. The hub's choice comes first, then agent roles before chore roles (`tiny`, `memory`, `commit`, `vision`), least-used subscription first. You can also type any role or model, or choose "Don't start it". The prompt appears whatever omp's approval mode is (including `--yolo`); a session with no one to ask (`omp -p`) can't spawn. If you decline, the hub is told and doesn't retry.
 
+### The plan, tasks and steps
+
+The hub plans; its agents expand. This is enforced by the tools rather than left to the model, so the plan means the same with any hub model:
+
+- `peer_plan` (hubs) sets the plan: tasks with short ids (`t1`, `t2`, …), a few words each, an owner, and the tasks each waits for (`after`). It replaces the whole plan; a task given without an owner keeps the one it has.
+- `peer_spawn` needs `tasks`: the ids of plan tasks the new agent owns. A spawn with no plan, no tasks, unknown ids, or a task a running agent still owns is refused, with what to do instead. The approval dialog lists the tasks. The tasks are assigned to the agent, under the name it actually joins with.
+- The agent's briefing lists its tasks and tells it to expand each into its concrete steps with `peer_steps` (task id and ordered steps, each marked done when it is) before other work, and to keep them current.
+- A task is done when the hub marks it so or its agent has finished all its steps. `peer_status finished: true` is refused while any of the agent's tasks isn't, naming each and how far it is.
+- `peer_list` shows the hub each agent's tasks and progress (`t1 3/5 steps`, `t2 done`); the swarm view shows them on the agent's card.
+- Renaming keeps it all: a hub's plan, and an agent's tasks and steps, follow the new name.
+
+### The swarm view (herdr)
+
+A hub in herdr owns a live view of its swarm, in a pane to the right of its own: [Blueprint](https://github.com/chappse6/herdr-blueprint) (MIT, by Seeun Park), integrated whole in `view/` and changed to show the swarm. The hub draws the first part with its plan and each agent goes on from its tasks with its steps; peer-mail turns both into the drawing, so it costs no tokens beyond those two tools.
+
+- It opens by itself when a hub in herdr starts or joins the swarm, without taking focus; a view already open in that workspace is pointed at the new hub instead. Close it (`q`) and it stays closed; `/swarm-view` reopens it (or focuses it).
+- It looks like Blueprint because it is Blueprint: a Markdown document with the swarm's summary, a Mermaid diagram drawn by termaid, and a table of the agents (status, current step, model, mail). The diagram is drawn in two parts, both left to right. The hub's part comes from its plan: the hub, its agents, and the tasks it gave each (`t1`, `t2`, …), with an arrow from each task to the tasks that wait for it; tasks the hub keeps (unassigned, or assigned to itself) hang off the hub on a dashed arrow, and an agent the plan names but that hasn't been spawned shows as "not started". Each agent's part goes on from its task's box: the steps it drew the task out into with `peer_steps` (`✓` done, `▸` next), in the task's row, a branch (`after`) on the row below, and steps tied to code with `code` carry a `%% code:` line like any Blueprint diagram (so `c` in point mode opens that code). Each task's boxes stay in its agent's rows: peer-mail places every box itself and termaid routes the arrows.
+- A new version changes only what changed: blocks of the page whose text is the same stay as they are (a status that only shows in the table leaves the diagram alone), the page keeps its scroll position and point-mode selection, and a new diagram is drawn before it is swapped in, so it never flashes Blueprint's "Drawing diagram…" placeholder. A change that leaves the diagram as it was (the table's Now column changes with every tool call) goes up at most every 2 s. A swarm that doesn't change draws nothing.
+- What moves is drawn over the finished diagram, so the layout never shifts, and only for a moment after a change, so the page stays free for scrolling and clicks: an agent's box pulses (reverse, then bright, then back) when its state, status, tasks or mail change; a task or step that gets done flashes; mail between the hub and an agent runs as a dot along the arrow joining them. While agents work, a spinner in the header says how many (`⠙ 3 working`). Between changes boxes keep their state's colour: working agents and their next step in the warning colour, finished agents and done tasks and steps in the success colour, offline agents in the error colour, agents not started and tasks still waiting muted.
+- Click a box (a task, a step, an agent or the hub) to see what it stands for: its owner, progress and steps, and the brief the hub spawned its agent with. A click beside the boxes does nothing. In point mode (`e`, then `hjkl`), a click selects the box under it and `i` shows the same details for the selected box.
+- Point mode's notes go to the hub, the agent beside the view: Enter types "In the swarm view I pointed at agent "tester" (working; tasks: t2). Act on it, or pass it on to tester with peer_send user_quote." and your words into the hub's prompt.
+- Blueprint's other keys work as in Blueprint (`hjkl`, `g`/`G`, `ctrl+d`/`ctrl+u`, `t` theme, `r` reload, `q` quit). What doesn't fit a swarm view is off in it: asking the agent beside it to draw (`a`), editing the document's text (the second `e`), and opening a file (`o`), which the swarm's next change would replace.
+- The view is the herdr plugin in this directory (`herdr-plugin.toml`, pane `view`, running `uv run --project view python -m herdr_blueprint swarm` with `PEER_MAIL_VIEW` naming its record and `BLUEPRINT_SOURCE_PANE` the hub's pane). Which pane shows a workspace's view, and which hub it follows (by pid, so a renamed hub keeps it), is recorded in `~/.omp/peer-mail/views/`. `view/README.md` says what changed from Blueprint.
+
 ### Models and subscriptions
 
 Models come from your omp `modelRoles`. A hub's `peer_models` lists them along with each subscription's limits as reported, such as `5 hours 100%, resets 21:46` or `7 days 47%`, how many swarm agents already run on it, and "no subagents" for Cursor (its models start subagents through Cursor's own protocol, which omp doesn't implement). A subscription counts as exhausted when a limit every request counts against is spent. Separate pools on the same window, like Cursor's "Cursor Models" and "Other Models", are alternatives, so one spent pool doesn't make Cursor exhausted. `peer_spawn` takes a `model`: a role (`@slow`, `@default`) or a model (`openai-codex/gpt-6.1-sol`). An agent named after a role (`plan`, `slow`, …) defaults to that role. Otherwise the agent goes to the subscription with the most room: usage plus 0.1 per agent already on it. Subscriptions 90% used or exhausted are skipped while any other is left, and chore roles are never picked. Spawns therefore spread across Anthropic, OpenAI Codex and Cursor instead of using up one. If you pick a different model in the approval dialog, `peer_spawn` tells the hub which model you chose instead of its own. The agent starts as `omp --model <provider>/<model>[:thinking]`, the model the role resolves to. It never gets the `@role` alias itself, because omp's `--model` matches model ids before roles, and `@default` matches a Google Vertex model whose id ends in `@default`.
@@ -100,7 +134,7 @@ Models come from your omp `modelRoles`. A hub's `peer_models` lists them along w
 
 A spawned agent is locked down so it can't set up its own way to reach other agents:
 
-- Its `bash` runs in a sandbox: `sandbox-exec` on macOS, landlock plus a seccomp filter (no `bind` or `listen`) on Linux. Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket (on Linux only where unprivileged user namespaces are allowed; see below). macOS also blocks the graph view's port; Linux does not (a filter that denies one outbound TCP port would deny the rest). The kitty and peer-mail environment variables are removed. Outbound network, the repo and everything else work. Linux needs `python3` on PATH.
+- Its `bash` runs in a sandbox: `sandbox-exec` on macOS, landlock plus a seccomp filter (no `bind` or `listen`) on Linux. Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket or herdr's API sockets (`herdr.sock`, `herdr-client.sock` and the session's `HERDR_SOCKET_PATH`; through herdr it could type into the hub's pane), on Linux only where unprivileged user namespaces are allowed; see below. herdr's SSH agent socket stays reachable, so `ssh` still authenticates. macOS also blocks the graph view's port; Linux does not (a filter that denies one outbound TCP port would deny the rest). The kitty, herdr and peer-mail environment variables are removed. Outbound network, the repo and everything else work. Linux needs `python3` on PATH.
 - A sandboxed command reads as `<dir>/sandbox-<hash> '<command>'`, with `<dir>` = `/tmp/peer-mail-<uid>` on macOS and `~/.omp/peer-mail-sandbox-<uid>` on Linux. The script holds the profile, which used to be spelled out inline in every command. The script directory is private to you, and the sandbox can't write to it.
 - It has no `eval` (kernels can't be sandboxed), and `bash` can't start long-lived services (`name`/`ready`).
 - Its other tools (`read`, `write`, `grep`, …) are refused if their arguments name the peer-mail directory or the sandbox's directory.
@@ -110,7 +144,7 @@ Heavy work on this machine goes through `peer_run`, the machine-wide run queue: 
 
 ## Graph view
 
-`/swarm-graph` opens a page in your browser that draws the swarm live: hubs, their agents, and the edges mail can travel. Members that aren't running are drawn hollow, a badge shows mail waiting, edges light up when a message crosses them, and recent mail is listed on the right. Click a running member to bring its omp window in kitty to the front; drag members to arrange them.
+`/swarm-graph` opens a page in your browser that draws the swarm live: hubs, their agents, and the edges mail can travel. Members that aren't running are drawn hollow, a badge shows mail waiting, edges light up when a message crosses them, and recent mail is listed on the right. Click a running member to bring its herdr pane (`herdr agent focus`) or its kitty window to the front; drag members to arrange them.
 
 The page is served by `bun src/cli.ts graph` on `http://127.0.0.1:7577/` (`PEER_MAIL_GRAPH_PORT` changes it), which `/swarm-graph` starts in the background. It stops by itself a minute after the page is closed.
 
@@ -118,7 +152,9 @@ The page is served by `bun src/cli.ts graph` on `http://127.0.0.1:7577/` (`PEER_
 
 ```bash
 cd ~/code/peer-mail && bun install
+(cd view && uv sync)                 # the swarm view (Blueprint): Python 3.10+, through uv
 omp plugin link ~/code/peer-mail
+herdr plugin link ~/code/peer-mail   # the swarm view pane
 ```
 
 New omp sessions load it; restart running ones.
@@ -142,6 +178,8 @@ Everything is files under `~/.omp/peer-mail/` (`PEER_MAIL_DIR` moves it). The sw
 | `inbox/<name>/<id>.json` | mail not yet received |
 | `delivered/<name>/<id>.json` | mail received |
 | `spawns/<id>.json` | a hub's request for a new agent, until that session starts and takes it |
+| `plans/<hub>.json` | a hub's plan (`peer_plan`): tasks, owners, order |
+| `steps/<name>.json` | an agent's steps for each task it owns (`peer_steps`) |
 
 The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop waiting runs: `runs/<id>.json` is a queued run (the first one whose session is alive is running), `runs/<id>.mark` is the marker file its processes hold. Tickets of sessions that have died are dropped by the next reader.
 
@@ -152,6 +190,8 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 | `src/transport.ts` | the swarm mail directory: phases, members and their graph, send, receive, spawn requests |
 | `src/inbox.ts` | one session's membership, and how a message reads to the agent |
 | `src/kitty.ts` | kitty remote control: opening a split, focusing a member's window |
+| `src/herdr.ts` | herdr: the swarm workspace, choosing the pane to split, starting and naming omp, focusing a member's pane |
+| `view/` | the swarm view: Blueprint, with `sources/swarm.py` (reading the swarm, writing its document) and `swarm_view.py` (animation, details, notes); see `view/README.md` |
 | `src/graph.ts`, `src/graph.html` | the graph view's server and page |
 | `src/models.ts` | your omp roles, subscription usage, and which model a new agent gets |
 | `src/sandbox.ts` | the sandbox (macOS `sandbox-exec`, Linux landlock + seccomp) spawned agents' commands run in |
@@ -165,11 +205,12 @@ The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop 
 
 - One machine: sessions on different machines don't see each other.
 - Who can message whom is fixed by the graph (vertex ↔ its hub, hub ↔ hub); isolation is by not joining.
-- Spawning and the graph's click-to-open need kitty with a remote-control socket (see above); clicking a member that runs outside kitty only says so.
+- Spawning needs herdr, or kitty with a remote-control socket (see above); the graph's click-to-open likewise, and clicking a member that runs in neither only says so.
+- The swarm view needs the hub to run in herdr with this directory linked as a herdr plugin (see Install).
 - A message from another session is a request, not the user's instruction, unless it carries a verified `user` quote; each member's briefing says so.
 - The sandbox and `peer_run` need macOS or Linux (Linux: x64 or arm64, and `python3`). Elsewhere a spawned agent's `bash` and `peer_run` are refused.
-- The sandbox closes listening sockets, the mailbox and kitty, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed. On Linux the graph view's port is not blocked.
-- Linux landlock can only grant access, so the directories on the way down to the mailbox and the script directory (`/`, `/home`, `~`, `~/.omp`) are list-only inside a command: nothing new can be created directly in them, and mailbox file names can be listed (not read). Entries created there later are usable from the next command on. Landlock can't stop a connect to a unix socket either, so kitty's socket is closed only when the private mount namespace is available; Ubuntu's AppArmor restriction on unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`) leaves it reachable.
+- The sandbox closes listening sockets, the mailbox, kitty and herdr, not shared files: agents working in the same repo or `/tmp` can still see each other's files. Outbound network is allowed. On Linux the graph view's port is not blocked.
+- Linux landlock can only grant access, so the directories on the way down to the mailbox and the script directory (`/`, `/home`, `~`, `~/.omp`) are list-only inside a command: nothing new can be created directly in them, and mailbox file names can be listed (not read). Entries created there later are usable from the next command on. Landlock can't stop a connect to a unix socket either, so kitty's and herdr's sockets are closed only when the private mount namespace is available; Ubuntu's AppArmor restriction on unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`) leaves them reachable, and the `herdr` command finds its default socket without the removed variables.
 - A process that leaves a run's process group and also closes the marker file isn't found when the run ends; it stays sandboxed.
 - `omp -p` runs have no slash commands, so they can't join.
 

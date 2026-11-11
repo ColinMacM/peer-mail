@@ -1,6 +1,7 @@
 /**
  * One session's membership of a swarm: its name, its heartbeat, and its incoming mail.
  */
+import { currentHerdrPane } from "./herdr";
 import { currentKittyWindow } from "./kitty";
 import { type Activity, type JoinOptions, type Message, type Peer, type SendOptions, type SpawnRequest, Swarm } from "./transport";
 import { LOADED_VERSION } from "./version";
@@ -21,19 +22,19 @@ export class Membership {
 	/** `/startswarm`: delete the swarm's members and mail, begin a new phase labelled `label`, and join it. */
 	static start(swarm: Swarm, label: string, desiredName: string, cwd: string, model?: string): Membership {
 		const phase = swarm.start(label, `${desiredName} (pid ${process.pid})`);
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow(), model, plugin: LOADED_VERSION }));
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { ...place(), model, plugin: LOADED_VERSION }));
 	}
 
 	/** `/swarm`: join the swarm as it is now. Fails when no swarm has been started. */
 	static attach(swarm: Swarm, desiredName: string, cwd: string, model?: string): Membership {
 		const phase = swarm.phase();
 		if (!phase) throw new Error("No swarm is running. Start one with /startswarm.");
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { kitty: currentKittyWindow(), model, plugin: LOADED_VERSION }));
+		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { ...place(), model, plugin: LOADED_VERSION }));
 	}
 
 	/** A session a hub launched with peer_spawn: join as the vertex its request names. */
 	static spawned(swarm: Swarm, request: SpawnRequest, cwd: string, model?: string): Membership {
-		const placement = { hub: request.hub, spawn: request.id, kitty: currentKittyWindow(), model, plugin: LOADED_VERSION };
+		const placement = { hub: request.hub, spawn: request.id, ...place(), model, plugin: LOADED_VERSION };
 		return new Membership(swarm, swarm.join(request.name, request.phase, cwd, placement));
 	}
 
@@ -53,8 +54,8 @@ export class Membership {
 
 	/** The join options that keep this member's place in the graph when it joins again. */
 	#placement(): JoinOptions {
-		const { kitty, model, spawn } = this.#peer;
-		return { hub: this.hub, kitty, model, plugin: LOADED_VERSION, ...(spawn ? { spawn } : {}) };
+		const { kitty, herdr, model, spawn } = this.#peer;
+		return { hub: this.hub, kitty, herdr, model, plugin: LOADED_VERSION, ...(spawn ? { spawn } : {}) };
 	}
 
 	/**
@@ -70,7 +71,7 @@ export class Membership {
 		return this.name;
 	}
 
-	/** Switch to `desiredName`, bringing along mail that was still waiting and any vertices. Returns the name taken. */
+	/** Switch to `desiredName`, bringing along mail that was still waiting, vertices, the plan, its tasks and steps. Returns the name taken. */
 	rename(desiredName: string): string {
 		const previous = this.#peer;
 		this.#peer = this.swarm.join(desiredName, previous.phase, previous.cwd, this.#placement());
@@ -78,6 +79,10 @@ export class Membership {
 			this.swarm.moveInbox(previous.name, this.name);
 			this.swarm.forget(previous);
 			this.swarm.reassignHub(previous.name, this.name);
+			this.swarm.movePlan(previous.name, this.name);
+			this.swarm.moveSteps(previous.name, this.name);
+			// The tasks this member owns, in its hub's plan (or its own, for a hub that kept some).
+			this.swarm.reassign(this.hub ?? this.name, previous.name, this.name);
 		}
 		return this.name;
 	}
@@ -100,6 +105,11 @@ export class Membership {
 	leave(how: "closed" | "left"): void {
 		this.swarm.leave(this.#peer, how);
 	}
+}
+
+/** Where this session runs: its kitty window and its herdr pane, whichever it has. */
+function place(): Pick<JoinOptions, "kitty" | "herdr"> {
+	return { kitty: currentKittyWindow(), herdr: currentHerdrPane() };
 }
 
 /**

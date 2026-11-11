@@ -51,6 +51,8 @@ export interface Peer {
 	spawn?: string;
 	/** Where the member's session runs in kitty, so the graph view can focus it. */
 	kitty?: KittyWindow;
+	/** Where the member's session runs in herdr, so the graph view can focus it and a hub can split beside it. */
+	herdr?: HerdrPane;
 	/** The model the member's session runs, as `provider/id`, refreshed with each heartbeat. */
 	model?: string;
 	/** What the member was doing at its last heartbeat. */
@@ -85,6 +87,51 @@ export interface KittyWindow {
 	socket: string;
 }
 
+/** A herdr pane, the herdr agent name of the omp running in it (spawned members), and the server's socket. */
+export interface HerdrPane {
+	socket: string;
+	/** The pane at join time; herdr gives a pane a new id when it moves to another workspace. */
+	pane: string;
+	/** The name `herdr agent start` gave it: follows the agent wherever its pane goes. */
+	agent?: string;
+}
+
+/** One task of a hub's plan, shown on its agents in the swarm view. */
+export interface PlanTask {
+	id: string;
+	title: string;
+	/** The member doing it: one of the hub's agents, possibly not spawned yet. */
+	agent?: string;
+	/** Ids of the tasks it waits for. */
+	after?: string[];
+	/** Set by the hub; a task is also done once its agent has finished all its steps. */
+	done?: boolean;
+}
+
+/**
+ * One step of a task, as the agent doing it drew the task out (peer_steps). The swarm view draws
+ * an agent's steps left to right from its task's box: each from the step it continues (`after`),
+ * the first from the task itself.
+ */
+export interface Step {
+	/** Short and unique within the task, e.g. 's1'. */
+	id: string;
+	title: string;
+	done?: boolean;
+	/** The id of the step it continues from; unset for the step right after the previous one. */
+	after?: string;
+	/** The code it stands for, as `path:line` (relative to the agent's directory). */
+	code?: string;
+}
+
+/** An agent's steps, by the id of the task they expand. */
+export type Steps = Record<string, Step[]>;
+
+/** Whether a task is done: the hub marked it so, or its agent expanded it into steps and finished them all. */
+export function taskDone(task: PlanTask, steps: Step[] | undefined): boolean {
+	return !!task.done || (!!steps && steps.length > 0 && steps.every(step => step.done));
+}
+
 /** A hub's request for a new vertex, read by the session the hub launches. */
 export interface SpawnRequest {
 	id: string;
@@ -92,6 +139,8 @@ export interface SpawnRequest {
 	hub: string;
 	name: string;
 	prompt: string;
+	/** Ids of the plan's tasks the new agent owns. */
+	tasks: string[];
 	createdAt: number;
 }
 
@@ -100,6 +149,7 @@ export interface JoinOptions {
 	hub?: string | null;
 	spawn?: string;
 	kitty?: KittyWindow;
+	herdr?: HerdrPane;
 	model?: string;
 	plugin?: string;
 }
@@ -272,6 +322,7 @@ export class Swarm {
 				hub: options.hub ?? null,
 				...(options.spawn ? { spawn: options.spawn } : {}),
 				...(options.kitty ? { kitty: options.kitty } : {}),
+				...(options.herdr ? { herdr: options.herdr } : {}),
 				...(options.model ? { model: options.model } : {}),
 				...(options.plugin ? { plugin: options.plugin } : {}),
 			};
@@ -300,12 +351,18 @@ export class Swarm {
 		}
 	}
 
-	/** Record a hub's request for a new vertex; the launched session finds it by id. */
-	requestSpawn(hub: Peer, name: string, prompt: string): SpawnRequest {
+	/** Record a hub's request for a new vertex; the launched session finds it by id. Its brief is kept for the swarm view. */
+	requestSpawn(hub: Peer, name: string, prompt: string, tasks: string[]): SpawnRequest {
 		this.requireCurrent(hub.phase);
-		const request: SpawnRequest = { id: randomUUID(), phase: hub.phase, hub: hub.name, name, prompt, createdAt: Date.now() };
+		const request: SpawnRequest = { id: randomUUID(), phase: hub.phase, hub: hub.name, name, prompt, tasks, createdAt: Date.now() };
 		writeJson(this.path("spawns", `${request.id}.json`), request);
+		writeJson(this.path("briefs", `${request.id}.json`), request);
 		return request;
+	}
+
+	/** The request a member was spawned for, kept after the spawn took it: the hub's brief and the tasks it gave. */
+	brief(spawn: string): SpawnRequest | undefined {
+		return readJson<SpawnRequest>(this.path("briefs", `${spawn}.json`));
 	}
 
 	/** Take a spawn request (it is used once). Undefined when it is gone, e.g. after /startswarm. */
@@ -421,6 +478,14 @@ export class Swarm {
 		return listDir(this.path("inbox", name)).filter(file => file.endsWith(".json")).length;
 	}
 
+	/** The messages waiting for `name`, read without taking them. */
+	waiting(name: string): Message[] {
+		return listDir(this.path("inbox", name))
+			.filter(file => file.endsWith(".json"))
+			.map(file => readJson<Message>(this.path("inbox", name, file)))
+			.filter((message): message is Message => message !== undefined);
+	}
+
 	/** The last `limit` messages `name` has received in this phase. */
 	history(name: string, limit = 20): Message[] {
 		return listDir(this.path("delivered", name))
@@ -438,5 +503,54 @@ export class Swarm {
 			writeJson(this.path("inbox", to, file), { ...message, to });
 			fs.rmSync(this.path("inbox", from, file), { force: true });
 		}
+	}
+
+	/** Replace `hub`'s plan. */
+	setPlan(hub: Peer, tasks: PlanTask[]): void {
+		this.requireCurrent(hub.phase);
+		writeJson(this.path("plans", `${hub.name}.json`), tasks);
+	}
+
+	/** The plan of the hub named `name`, empty when it has set none. */
+	plan(name: string): PlanTask[] {
+		return readJson<PlanTask[]>(this.path("plans", `${name}.json`)) ?? [];
+	}
+
+	/** Carry a hub's plan over to its new name. */
+	movePlan(from: string, to: string): void {
+		const file = this.path("plans", `${from}.json`);
+		if (!fs.existsSync(file)) return;
+		fs.renameSync(file, this.path("plans", `${to}.json`));
+	}
+
+	/** Make `agent` the owner of `hub`'s tasks `ids`. */
+	assign(hub: string, ids: string[], agent: string): void {
+		const plan = this.plan(hub);
+		if (plan.length === 0) return;
+		writeJson(this.path("plans", `${hub}.json`), plan.map(task => (ids.includes(task.id) ? { ...task, agent } : task)));
+	}
+
+	/** Hand every task of `hub`'s plan owned by `from` to `to` (a vertex that renamed itself). */
+	reassign(hub: string, from: string, to: string): void {
+		const ids = this.plan(hub).filter(task => task.agent === from).map(task => task.id);
+		if (ids.length > 0) this.assign(hub, ids, to);
+	}
+
+	/** Replace `member`'s steps for task `task`. */
+	setSteps(member: Peer, task: string, steps: Step[]): void {
+		this.requireCurrent(member.phase);
+		writeJson(this.path("steps", `${member.name}.json`), { ...this.steps(member.name), [task]: steps });
+	}
+
+	/** The steps of the member named `name`, by task id. */
+	steps(name: string): Steps {
+		return readJson<Steps>(this.path("steps", `${name}.json`)) ?? {};
+	}
+
+	/** Carry a member's steps over to its new name. */
+	moveSteps(from: string, to: string): void {
+		const file = this.path("steps", `${from}.json`);
+		if (!fs.existsSync(file)) return;
+		fs.renameSync(file, this.path("steps", `${to}.json`));
 	}
 }

@@ -134,7 +134,7 @@ svg.addEventListener("pointerup", () => {
   const node = state.nodes.find(n => n.name === dragging.name);
   if (!dragging.moved && node) {
     if (node.focusable) focusMember(node.name);
-    else toast(node.online ? `${node.name} isn't in a kitty window this can reach` : `${node.name} isn't running`);
+    else toast(node.online ? `${node.name} isn't in a herdr pane or kitty window this can reach` : `${node.name} isn't running`);
   }
   const p = sim.get(dragging.name);
   if (p) p.pinned = dragging.moved; // a dragged member stays where it was dropped

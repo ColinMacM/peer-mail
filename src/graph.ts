@@ -1,8 +1,9 @@
 /**
  * The graph view: a page on 127.0.0.1 that draws the swarm (hubs, their agents, the edges mail can
- * travel) live from the mail directory. Clicking a member brings its omp session's kitty window to
- * the front. The server stops by itself once no page has asked it anything for IDLE_EXIT_MS.
+ * travel) live from the mail directory. Clicking a member brings its omp session's kitty window or
+ * herdr pane to the front. The server stops by itself once no page has asked it anything for IDLE_EXIT_MS.
  */
+import { focusPane } from "./herdr";
 import { focusWindow } from "./kitty";
 import { type Message, Swarm } from "./transport";
 
@@ -17,7 +18,7 @@ export interface GraphNode {
 	online: boolean;
 	pending: number;
 	cwd: string;
-	/** Whether clicking can focus it: it runs, in a kitty with a remote-control socket. */
+	/** Whether clicking can focus it: it runs, in a herdr pane or in a kitty with a remote-control socket. */
 	focusable: boolean;
 }
 
@@ -35,7 +36,7 @@ export function graphState(swarm: Swarm): GraphState {
 	const peers = swarm.peers();
 	const nodes = peers.map(peer => {
 		const online = swarm.isOnline(peer);
-		return { name: peer.name, hub: peer.hub, online, pending: swarm.pending(peer.name), cwd: peer.cwd, focusable: online && !!peer.kitty };
+		return { name: peer.name, hub: peer.hub, online, pending: swarm.pending(peer.name), cwd: peer.cwd, focusable: online && !!(peer.herdr || peer.kitty) };
 	});
 	const hubs = nodes.filter(node => node.hub === null).map(node => node.name);
 	const edges: [string, string][] = [];
@@ -65,9 +66,10 @@ export function serveGraph(swarm: Swarm, port = DEFAULT_GRAPH_PORT): void {
 			if (focus && request.method === "POST") {
 				const peer = swarm.peer(decodeURIComponent(focus[1]));
 				if (!peer || !swarm.isOnline(peer)) return Response.json({ error: "That agent isn't running." }, { status: 409 });
-				if (!peer.kitty) return Response.json({ error: "That agent isn't in a kitty window this can reach." }, { status: 409 });
+				if (!peer.herdr && !peer.kitty) return Response.json({ error: "That agent isn't in a herdr pane or kitty window this can reach." }, { status: 409 });
 				try {
-					await focusWindow(peer.kitty);
+					if (peer.herdr) await focusPane(peer.herdr);
+					else if (peer.kitty) await focusWindow(peer.kitty);
 					return Response.json({ ok: true });
 				} catch (error) {
 					return Response.json({ error: (error as Error).message }, { status: 500 });

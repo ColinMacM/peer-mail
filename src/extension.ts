@@ -6,14 +6,17 @@
  *   /swarm                         show the swarm and its members
  *   /swarm-leave                   leave the swarm; the session is isolated again
  *   /peer-name [name]              show or change this session's name in the swarm
+ *   /swarm-view                    reopen or focus the swarm view beside a hub in herdr (it opens on joining)
  *
  * `[label]` says what the run is for (default: the session's directory name). A session that
  * hasn't joined is isolated: it has no peer tools and no one can mail it.
  *
  * The swarm is a graph. Sessions joined by hand (/startswarm, /swarm) are hubs; a hub's
- * `peer_spawn` opens a kitty split running a new omp session that joins as one of its vertices.
+ * `peer_spawn` opens a new omp session that joins as one of its vertices: in a pane of the hub's
+ * own herdr workspace (herdr.ts) or in a kitty split (kitty.ts).
  * A vertex can message only its hub; a hub can message its vertices and the other hubs. Members
- * get `peer_list`, `peer_send` and `peer_rename`; hubs also `peer_spawn` and `peer_models`;
+ * get `peer_list`, `peer_send` and `peer_rename`; hubs also `peer_spawn` and `peer_models`, and in
+ * herdr `peer_plan` for the swarm view they own (view.ts, screen.ts);
  * vertices also `peer_run`, the machine-wide queue for heavy runs. A vertex is locked down: its
  * bash and queued runs execute in a sandbox (sandbox.ts), it has no eval or long-lived services,
  * and its other tools can't touch the peer-mail directory. Mail never interrupts a hub: it arrives
@@ -22,11 +25,13 @@
  * agent can rename itself.
  */
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { isToolCallEventType } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { DEFAULT_GRAPH_PORT, graphRunning } from "./graph";
+import { focusPluginPane, inHerdr, openAgentPane, openViewPane, paneExists, type ViewRecord, viewRecordPath } from "./herdr";
 import { formatForAgent, Membership, POLL_MS } from "./inbox";
 import { openSplit, type SplitDirection, splitUnavailable } from "./kitty";
 import {
@@ -44,14 +49,26 @@ import {
 import { RunQueue, type RunTicket, runsElsewhere } from "./queue";
 import { userSaid, verifiedQuote } from "./quote";
 import { realPath, SANDBOX_DIR, SANDBOXED, sandboxedCommand, sandboxProfile, sandboxScript, sandboxUnavailable } from "./sandbox";
-import { type Activity, BROADCAST, HEARTBEAT_MS, type Message, StalePhaseError, Swarm } from "./transport";
+import {
+	type Activity,
+	BROADCAST,
+	HEARTBEAT_MS,
+	type Message,
+	type PlanTask,
+	readJson,
+	StalePhaseError,
+	type Step,
+	Swarm,
+	taskDone,
+	writeJson,
+} from "./transport";
 import { codeVersion } from "./version";
 
 // Every member gets these; hubs and vertices each add their own.
 const MEMBER_TOOLS = ["peer_list", "peer_send", "peer_rename", "peer_status"];
-const HUB_TOOLS = [...MEMBER_TOOLS, "peer_spawn", "peer_models"];
-const VERTEX_TOOLS = [...MEMBER_TOOLS, "peer_run"];
-const ALL_TOOLS = [...HUB_TOOLS, "peer_run"];
+const HUB_TOOLS = [...MEMBER_TOOLS, "peer_plan", "peer_spawn", "peer_models"];
+const VERTEX_TOOLS = [...MEMBER_TOOLS, "peer_steps", "peer_run"];
+const ALL_TOOLS = [...HUB_TOOLS, "peer_steps", "peer_run"];
 const ISOLATED = "This session is isolated: it hasn't joined the swarm (/swarm or /startswarm).";
 const DEFAULT_NAME = "agent";
 /** How long peer_spawn waits for the new session to join before reporting it as still starting. */
@@ -92,6 +109,33 @@ export default function peerMail(pi: ExtensionAPI) {
 		const others = pi.getActiveTools().filter(name => !ALL_TOOLS.includes(name));
 		const mine = !member ? [] : member.hub === null ? HUB_TOOLS : VERTEX_TOOLS;
 		await pi.setActiveTools([...others, ...mine]);
+	}
+
+	/** How far a task is: done, or how many of its steps are, or that it has none yet. */
+	function progress(task: PlanTask, steps: Step[] | undefined): string {
+		if (taskDone(task, steps)) return "done";
+		return steps?.length ? `${steps.filter(step => step.done).length}/${steps.length} steps` : "no steps yet";
+	}
+
+	/**
+	 * Open the hub's swarm view to the right of its pane, keeping focus where it is; a view already
+	 * open in its workspace is pointed at this hub instead. `focus` then brings the view to the front.
+	 */
+	async function showView(focus: boolean): Promise<void> {
+		const file = viewRecordPath(swarm.root, process.env.HERDR_SOCKET_PATH as string, process.env.HERDR_WORKSPACE_ID as string);
+		const record = readJson<ViewRecord>(file);
+		if (record && (await paneExists(record.pane))) {
+			writeJson(file, { ...record, hubPid: process.pid });
+			if (focus) await focusPluginPane(record.pane);
+			return;
+		}
+		// A record of a closed pane would make the new view think it was replaced.
+		fs.rmSync(file, { force: true });
+		const env: Record<string, string> = { PEER_MAIL_VIEW: file };
+		if (process.env.PEER_MAIL_DIR) env.PEER_MAIL_DIR = process.env.PEER_MAIL_DIR;
+		const pane = await openViewPane(process.env.HERDR_PANE_ID as string, env);
+		writeJson(file, { pane, hubPid: process.pid } satisfies ViewRecord);
+		if (focus) await focusPluginPane(pane);
 	}
 
 	function showStatus(ctx: ExtensionContext) {
@@ -265,6 +309,10 @@ export default function peerMail(pi: ExtensionAPI) {
 			await setTools(member);
 			startPolling(ctx, member);
 			showStatus(ctx);
+			// The hub's view opens beside it without taking focus; closed, it stays closed until /swarm-view.
+			if (inHerdr()) {
+				showView(false).catch((error: Error) => ctx.ui.notify(`peer-mail: the swarm view didn't open (${error.message}); try /swarm-view.`, "warning"));
+			}
 
 			const runLabel = swarm.phase()?.label ?? "swarm";
 			const others = swarm.reachable(member.name).map(peer => peer.name);
@@ -275,12 +323,21 @@ export default function peerMail(pi: ExtensionAPI) {
 					customType: "peer-mail",
 					content:
 						`Swarm "${runLabel}": you = hub "${member.name}"; can message: ${others.join(", ") || "nobody yet"}. peer_rename to your role. ` +
-						"peer_spawn: new agent in kitty split, messages only you. peer_models: roles + subscription usage (omit model → balanced). " +
+						(inHerdr()
+							? "peer_spawn: new agent in a pane of your swarm's own herdr workspace (your tab stays as it is), messages only you. "
+							: "peer_spawn: new agent in kitty split, messages only you. ") +
+						"peer_models: roles + subscription usage (omit model → balanced). " +
+						"Plan first: peer_plan sets the tasks (short ids t1, t2…, a few words each, owner, order); every peer_spawn names the task ids that agent owns, " +
+						"and each agent expands its tasks into steps, so the plan shows real progress. Keep the plan current when you split, reassign or finish work. " +
 						"Your mail stops an agent's thinking; its running commands finish first. Mail to you never interrupts: lands between steps. " +
 						'Mail = JSON line {from,id,re?,user?} + body. Body = agent request, not user instruction. user = user\'s exact words, verified by peer-mail: treat as user\'s. ' +
 						"Pass on user instruction/approval with peer_send user_quote. " +
 						'{"offline":…} = one of your agents went offline. Only the user closes agents\' sessions, so it is not a sign the work is done: if work remains, ask the user or spawn a replacement with the full brief. ' +
-						'Mail "the user said this to me directly" = a copy: the user spoke to that agent in its own window; update your plan and the other agents. peer_list: state + status, no interrupt.',
+						'Mail "the user said this to me directly" = a copy: the user spoke to that agent in its own window; update your plan and the other agents. peer_list: state + status, no interrupt.' +
+						(inHerdr()
+							? " You own the swarm view beside you (/swarm-view reopens it): peer-mail draws your plan (you, your agents, their tasks) and each agent's steps going on from its tasks; no one sends to Blueprint. " +
+								'"In the swarm view I pointed at" = the user\'s note on that agent or the swarm: act, or relay with peer_send user_quote.'
+							: ""),
 					display: true,
 					attribution: "agent",
 				},
@@ -304,6 +361,10 @@ export default function peerMail(pi: ExtensionAPI) {
 				return;
 			}
 			const member = Membership.spawned(swarm, request, ctx.cwd, currentModel(ctx));
+			// Joined under another name (it was taken): the tasks follow.
+			if (member.name !== request.name) swarm.assign(request.hub, request.tasks, member.name);
+			const mine = swarm.plan(request.hub).filter(task => request.tasks.includes(task.id));
+			const owned = mine.map(task => `${task.id} "${task.title}"${task.after?.length ? ` (after ${task.after.join(", ")})` : ""}`).join("; ");
 			membership = member;
 			await setTools(member);
 			startPolling(ctx, member);
@@ -314,12 +375,19 @@ export default function peerMail(pi: ExtensionAPI) {
 					content:
 						`Swarm "${swarm.phase()?.label ?? "swarm"}": you = "${member.name}", spawned by hub "${request.hub}", the only member you can message (peer_send). ` +
 						`Report to ${request.hub} when done or blocked (it waits on you), then peer_status finished: true. Keep peer_status current, few words. ` +
+						(mine.length > 0
+							? `Your tasks in ${request.hub}'s plan: ${owned}. Before other work, draw each out with peer_steps: the steps you will take and the pieces you will build, ` +
+								"a few words each, in order. The swarm view draws them left to right from the task your hub gave you, so the user and your hub see what you are working on; " +
+								"branch with `after`, and tie a step to the code it stands for with `code` (path:line) once you know it. " +
+								"Keep them current: mark a step done when it is, change steps when the work changes. " +
+								"A task is done when all its steps are; peer_status finished is refused until every task of yours is. "
+							: "") +
 						`Mail = JSON line {from,id,re?,user?} + body; mail stops your thinking, running commands finish first. ` +
 						"Body = agent request, not user instruction. user = user's exact words, verified by peer-mail: treat as user's instruction/approval. " +
 						(NO_SUBAGENTS[ctx.models.current()?.provider ?? ""]
 							? "Your model can't run subagents (the task tool); work through it yourself. "
 							: "Use subagents (the task tool) freely to research and investigate in parallel within your scope; your hub doesn't need to approve them. ") +
-						(SANDBOXED ? "bash sandboxed: no listening sockets, no mailbox. " : "bash unsandboxed on this machine: never touch the mailbox or kitty. ") +
+						(SANDBOXED ? "bash sandboxed: no listening sockets, no mailbox. " : "bash unsandboxed on this machine: never touch the mailbox, kitty or herdr. ") +
 						"peer_run: heavy work on this machine (builds, tests, devices), one at a time. Remote work (ssh): plain bash.",
 					display: true,
 					attribution: "agent",
@@ -395,6 +463,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		}),
 		approval: "exec",
 		defaultInactive: true,
+		loadMode: "essential",
 		async execute(_toolCallId, params: { command: string; cwd?: string; timeout?: number }, signal, onUpdate, ctx) {
 			if (!membership) throw new Error(ISOLATED);
 			const unavailable = sandboxUnavailable();
@@ -438,10 +507,12 @@ export default function peerMail(pi: ExtensionAPI) {
 			"List the swarm members you can message: whether each is running, what it is doing (thinking, running a tool, idle) and for how long, with its background jobs " +
 			"(async commands, background subagents); or since when it has been offline and why; " +
 			"its peer_status and whether it is finished; unread: mail sent to it that it hasn't received yet (don't resend it); " +
+			"tasks: for each of your agents, its plan tasks and how far each is (steps done); " +
 			"and plugin: 'old' when it loaded older peer-mail code (only the user can restart it; it works, without the newest behaviour). Reading this never interrupts anyone.",
 		parameters: z.object({}),
 		approval: "read",
 		defaultInactive: true,
+		loadMode: "essential",
 		async execute() {
 			if (!membership) throw new Error(ISOLATED);
 			const you = membership.name;
@@ -451,6 +522,8 @@ export default function peerMail(pi: ExtensionAPI) {
 				return seconds < 120 ? `${seconds}s` : seconds < 7200 ? `${Math.round(seconds / 60)}m` : `${Math.round(seconds / 3600)}h`;
 			};
 			const current = codeVersion();
+			// A hub sees how far each of its agents' tasks are.
+			const plan = membership.hub === null ? swarm.plan(you) : [];
 			const peers = swarm.reachable(you).map(peer => {
 				const how = peer.leftHow === "closed" ? "closed by the user" : peer.leftHow === "left" ? "left the swarm" : "process died";
 				const state = !swarm.isOnline(peer)
@@ -459,6 +532,8 @@ export default function peerMail(pi: ExtensionAPI) {
 						? describeActivity(peer.activity, ago(peer.activity.since))
 						: "online";
 				const unread = swarm.pending(peer.name);
+				const steps = swarm.steps(peer.name);
+				const tasks = plan.filter(task => task.agent === peer.name).map(task => `${task.id} ${progress(task, steps[task.id])}`);
 				return {
 					name: peer.name,
 					hub: peer.hub,
@@ -468,6 +543,7 @@ export default function peerMail(pi: ExtensionAPI) {
 					...(unread > 0 ? { unread } : {}),
 					...(peer.model ? { model: peer.model } : {}),
 					...(peer.plugin !== current ? { plugin: "old" } : {}),
+					...(tasks.length > 0 ? { tasks: tasks.join(", ") } : {}),
 				};
 			});
 			const details = { swarm: swarm.phase()?.label, you, hub: membership.hub, peers };
@@ -499,6 +575,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		}),
 		approval: "write",
 		defaultInactive: true,
+		loadMode: "essential",
 		// The published typings don't infer zod schemas into `params`; this matches the schema above.
 		async execute(_toolCallId, params: { to: string; message: string; reply_to?: string; user_quote?: string }, _signal, _onUpdate, ctx) {
 			if (!membership) throw new Error(ISOLATED);
@@ -533,15 +610,28 @@ export default function peerMail(pi: ExtensionAPI) {
 		label: "Peer status",
 		description:
 			"Set your status, shown to the others in peer_list without messaging or interrupting anyone: what you're on, in a few words (e.g. 'fixing gripper timeout; tests 3/5 pass'). " +
-			"Set finished when your work is done (after reporting it): broadcasts then skip you, and new mail to you makes you unfinished again.",
+			"Set finished when your work is done (after reporting it): broadcasts then skip you, and new mail to you makes you unfinished again. " +
+			"An agent with plan tasks can't set finished until each is done (all its steps, or the hub marked it done).",
 		parameters: z.object({
 			status: z.string().max(200).optional().describe("A few words; omit to keep the current one."),
 			finished: z.boolean().optional().describe("true when your work is done; false when you take on more."),
 		}),
 		approval: "read",
 		defaultInactive: true,
+		loadMode: "essential",
 		async execute(_toolCallId, params: { status?: string; finished?: boolean }) {
 			if (!membership) throw new Error(ISOLATED);
+			const hub = membership.hub;
+			if (params.finished && hub !== null) {
+				const steps = swarm.steps(membership.name);
+				const open = swarm
+					.plan(hub)
+					.filter(task => task.agent === membership?.name && !taskDone(task, steps[task.id]))
+					.map(task => `${task.id} (${progress(task, steps[task.id])})`);
+				if (open.length > 0) {
+					throw new Error(`Not finished: ${open.join(", ")}. Finish their steps (peer_steps marks them done), or ask ${hub} to change the plan.`);
+				}
+			}
 			const status = params.status?.trim();
 			const update = { ...(status ? { status } : {}), ...(params.finished !== undefined ? { finished: params.finished } : {}) };
 			membership.setStatus(update);
@@ -560,6 +650,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		}),
 		approval: "write",
 		defaultInactive: true,
+		loadMode: "essential",
 		async execute(_toolCallId, params: { name: string }, _signal, _onUpdate, ctx) {
 			if (!membership) throw new Error(ISOLATED);
 			const previous = membership.name;
@@ -579,6 +670,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		parameters: z.object({}),
 		approval: "read",
 		defaultInactive: true,
+		loadMode: "essential",
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			if (!membership) throw new Error(ISOLATED);
 			const options = await modelOptions(ctx, pi.pi.settings, swarm.peers());
@@ -629,7 +721,8 @@ export default function peerMail(pi: ExtensionAPI) {
 			description: `${item.provider}/${item.model} — ${item === choice ? item.reason : status(item.provider)}`,
 		}));
 		const title = `Start a new agent "${name}"?`;
-		const question = `Start "${name}" for ${membership?.name} (omp in a kitty split, ${ctx.cwd})? Pick its model. Its task:\n\n${prompt}`;
+		const where = inHerdr() ? "a herdr pane in your swarm workspace" : "a kitty split";
+		const question = `Start "${name}" for ${membership?.name} (omp in ${where}, ${ctx.cwd})? Pick its model. Its task:\n\n${prompt}`;
 		if (ctx.ui.askDialog) {
 			const result = await ctx.ui.askDialog([{ id: "spawn", header: title, question, options: [...items, { label: decline }], recommended: 0 }]);
 			if (!result || result.kind !== "submit") return undefined;
@@ -645,7 +738,7 @@ export default function peerMail(pi: ExtensionAPI) {
 		name: "peer_spawn",
 		label: "Peer spawn",
 		description:
-			"Start another agent: a new omp session in a kitty split beside this one, working on `prompt`. It joins the swarm as one of your vertices: " +
+			`Start another agent: a new omp session ${inHerdr() ? "in a pane of your swarm's own herdr workspace (created on the first spawn; your tab stays as it is)" : "in a kitty split beside this one"}, working on \`prompt\`. It joins the swarm as one of your vertices: ` +
 			"it can only message you (with peer_send), and its messages arrive in your conversation. Give it a role name and a full brief as `prompt`: " +
 			"it starts knowing nothing of your conversation, so put in everything it needs. Choose its model with `model` (see peer_models): " +
 			"one of the user's omp roles ('@slow', '@plan', …) suited to its work, or a model; leave it out to use the subscription with the most room. " +
@@ -653,7 +746,8 @@ export default function peerMail(pi: ExtensionAPI) {
 			"Spawn early and often: agents are how a hub works. When your task has work for other agents, start them before doing your own investigation, and let each inspect its own area; " +
 			"split work into parallel agents, with separate agents for verification and end-to-end checks. If they need something you are still preparing (a contract, a decision), " +
 			"spawn them anyway to investigate read-only, and send it when ready. Before spawning, check peer_list so the new agent's files and responsibilities don't overlap an active agent's, " +
-			"and state its boundaries in the brief. While agents work, end your turn instead of waiting: their mail starts your next turn.",
+			"and state its boundaries in the brief. Every agent owns tasks of your plan: set them with peer_plan first, then name their ids in `tasks`; the agent expands them into steps. " +
+			"While agents work, end your turn instead of waiting: their mail starts your next turn.",
 		parameters: z.object({
 			name: z.string().describe("Its name in the swarm, usually its role, e.g. 'reviewer'."),
 			prompt: z
@@ -663,14 +757,19 @@ export default function peerMail(pi: ExtensionAPI) {
 						"constraints and what not to touch; what done looks like; what to report to you and when. Longer is better than ambiguous.",
 				),
 			model: z.string().optional().describe("An omp role ('@slow') or model ('openai-codex/gpt-6.1-sol'); omit to balance across subscriptions."),
-			split: z.enum(["auto", "vertical", "horizontal"]).optional().describe("How to split this window (default auto)."),
+			tasks: z.array(z.string()).describe("Ids of your plan's tasks (peer_plan) this agent owns, e.g. ['t2', 't3']: at least one."),
+			split: z
+				.enum(["auto", "vertical", "horizontal"])
+				.optional()
+				.describe("How to split: auto (default) along the longer side, vertical side by side, horizontal stacked."),
 		}),
 		// The tool asks the user itself (below), showing the name, task and model, so the generic approval gate doesn't ask twice.
 		approval: { tier: "exec", policy: "allow" },
 		defaultInactive: true,
+		loadMode: "essential",
 		async execute(
 			_toolCallId,
-			params: { name: string; prompt: string; model?: string; split?: SplitDirection },
+			params: { name: string; prompt: string; model?: string; tasks: string[]; split?: SplitDirection },
 			signal,
 			_onUpdate,
 			ctx,
@@ -678,32 +777,77 @@ export default function peerMail(pi: ExtensionAPI) {
 			if (!membership) throw new Error(ISOLATED);
 			const hub = membership.hub;
 			if (hub !== null) throw new Error(`Only hubs can spawn agents; you are an agent of ${hub}.`);
-			const unavailable = splitUnavailable();
+			const herdrSpawn = inHerdr();
+			const unavailable = herdrSpawn ? undefined : splitUnavailable();
 			if (unavailable) throw new Error(unavailable);
 			// A spawn always needs the user's say-so, whatever the approval mode; with no one to ask, it's refused.
 			if (!ctx.hasUI) throw new Error("Spawning an agent needs the user's permission, and this session has no one to ask.");
+			// Every agent owns part of the plan, so the plan says who does what and its progress is real.
+			const plan = swarm.plan(membership.name);
+			const ids = [...new Set((params.tasks ?? []).map(id => id.trim()).filter(Boolean))];
+			if (plan.length === 0) {
+				throw new Error("Set the plan first: peer_plan with tasks (short ids t1, t2…, a few words each, owner, order), then spawn with `tasks` naming the ids this agent owns.");
+			}
+			const known = plan.map(task => task.id);
+			if (ids.length === 0) throw new Error(`Name the tasks this agent owns in \`tasks\` (your plan has ${known.join(", ")}); add tasks with peer_plan if none fits.`);
+			const unknown = ids.filter(id => !known.includes(id));
+			if (unknown.length > 0) throw new Error(`${unknown.join(", ")} isn't in your plan (it has ${known.join(", ")}); add it with peer_plan first.`);
+			const taken = plan.filter(task => ids.includes(task.id) && task.agent && task.agent !== params.name && task.agent !== membership?.name).filter(task => {
+				const owner = swarm.peer(task.agent as string);
+				return owner && swarm.isOnline(owner) && !taskDone(task, swarm.steps(owner.name)[task.id]);
+			});
+			if (taken.length > 0) {
+				throw new Error(`${taken.map(task => `${task.id} belongs to ${task.agent}, which is still running`).join("; ")}. Reassign it with peer_plan first, or pick other tasks.`);
+			}
 			const options = await modelOptions(ctx, pi.pi.settings, swarm.peers());
 			// An agent named after one of the user's roles runs on that role unless the hub says otherwise.
 			const spec = params.model?.trim() || (options.roles.some(role => role.role === params.name) ? `@${params.name}` : undefined);
 			const proposed = spec ? requestedChoice(ctx, options, spec) : autoChoice(ctx, options);
 			if (!proposed) throw new Error("No model is available to run the agent on.");
-			const choice = await approveSpawn(ctx, params.name, params.prompt, proposed, options);
+			const titles = plan.filter(task => ids.includes(task.id)).map(task => `${task.id} ${task.title}`).join("; ");
+			const choice = await approveSpawn(ctx, params.name, `Tasks: ${titles}\n\n${params.prompt}`, proposed, options);
 			if (!choice) throw new Error(`The user declined to start "${params.name}".`);
-			const request = swarm.requestSpawn(membership.peer, params.name, params.prompt);
-			const env: Record<string, string> = { PEER_MAIL_SPAWN: request.id, PATH: process.env.PATH ?? "" };
+			swarm.assign(membership.name, ids, params.name);
+			const request = swarm.requestSpawn(membership.peer, params.name, params.prompt, ids);
+			const env: Record<string, string> = { PEER_MAIL_SPAWN: request.id };
 			if (process.env.PEER_MAIL_DIR) env.PEER_MAIL_DIR = process.env.PEER_MAIL_DIR;
-			const window = await openSplit({
-				command: [Bun.which("omp") ?? "omp", "--model", choice.launch],
-				cwd: ctx.cwd,
-				title: `omp · ${params.name}`,
-				env,
-				direction: params.split ?? "auto",
-				// This hub's agents in this kitty; the largest window among them and the hub is split.
-				splittable: swarm
-					.peers()
-					.filter(peer => peer.hub === membership?.name && peer.kitty?.socket === process.env.KITTY_LISTEN_ON)
-					.flatMap(peer => (peer.kitty ? [peer.kitty.window] : [])),
-			});
+			let where: string;
+			let placement: Record<string, unknown>;
+			if (herdrSpawn) {
+				const hubName = membership.name;
+				const placed = await openAgentPane({
+					name: params.name,
+					args: ["--model", choice.launch],
+					cwd: ctx.cwd,
+					env,
+					label: `${swarm.phase()?.label ?? "swarm"} · ${hubName}`,
+					direction: params.split ?? "auto",
+					// This hub's running agents on this herdr server; the largest of their panes is split.
+					agents: swarm
+						.peers()
+						.filter(peer => peer.hub === hubName && peer.herdr?.socket === process.env.HERDR_SOCKET_PATH && swarm.isOnline(peer))
+						.flatMap(peer => (peer.herdr?.agent ? [peer.herdr.agent] : [])),
+				});
+				const waiting = placed.notReady ? "; omp is waiting for input there (a dialog)" : "";
+				where = `herdr pane ${placed.pane} (herdr agent ${placed.agent}, workspace ${placed.workspace}${waiting})`;
+				placement = { herdr: placed };
+			} else {
+				const window = await openSplit({
+					command: [Bun.which("omp") ?? "omp", "--model", choice.launch],
+					cwd: ctx.cwd,
+					title: `omp · ${params.name}`,
+					// kitty launches omp without a shell, so it gets this session's PATH.
+					env: { ...env, PATH: process.env.PATH ?? "" },
+					direction: params.split ?? "auto",
+					// This hub's agents in this kitty; the largest window among them and the hub is split.
+					splittable: swarm
+						.peers()
+						.filter(peer => peer.hub === membership?.name && peer.kitty?.socket === process.env.KITTY_LISTEN_ON)
+						.flatMap(peer => (peer.kitty ? [peer.kitty.window] : [])),
+				});
+				where = `kitty window ${window}`;
+				placement = { window };
+			}
 			// The hub should know when the user overrode its choice, so it doesn't misread the agent's model later.
 			const changed = choice.launch !== proposed.launch ? ` The user chose this model at approval instead of your ${proposed.selector} (${proposed.provider}/${proposed.model}).` : "";
 			const on = `${choice.selector} (${choice.provider}/${choice.model})`;
@@ -711,13 +855,129 @@ export default function peerMail(pi: ExtensionAPI) {
 			while (Date.now() < deadline && !signal?.aborted) {
 				const joined = swarm.spawned(request.id);
 				if (joined) {
-					const text = `Started "${joined.name}" on ${on} in kitty window ${window}. It is working on your prompt and will message you.${changed}`;
-					return { content: [{ type: "text", text }], details: { name: joined.name, window, model: choice } };
+					const text = `Started "${joined.name}" on ${on} in ${where}. It is working on your prompt and will message you.${changed}`;
+					return { content: [{ type: "text", text }], details: { name: joined.name, ...placement, model: choice } };
 				}
 				await Bun.sleep(500);
 			}
-			const text = `Opened kitty window ${window} for ${on}, but the agent hasn't joined the swarm yet; check it with peer_list shortly.${changed}`;
-			return { content: [{ type: "text", text }], details: { name: params.name, window, model: choice } };
+			const text = `Opened ${where} for ${on}, but the agent hasn't joined the swarm yet; check it with peer_list shortly.${changed}`;
+			return { content: [{ type: "text", text }], details: { name: params.name, ...placement, model: choice } };
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_plan",
+		label: "Peer plan",
+		description:
+			"Set your swarm's plan: the tasks, who does each, and which waits for which. Every agent owns tasks of it (peer_spawn's `tasks`) and expands them into steps; " +
+			"peer_list and the swarm view (in herdr) show each task's progress. Replaces the whole plan: call it when you split work, add, assign or reassign a task, or one is done. " +
+			"A task given without an agent keeps its current owner; assign it to yourself to keep it. Tasks only: findings come from your agents' reports.",
+		parameters: z.object({
+			tasks: z
+				.array(
+					z.object({
+						id: z.string().describe("Short and stable, e.g. 't1'."),
+						title: z.string().describe("A few words; the box is about 25 characters wide."),
+						agent: z.string().optional().describe("The agent doing it: one you spawned or are about to spawn."),
+						after: z.array(z.string()).optional().describe("Ids of the tasks it waits for."),
+						done: z.boolean().optional(),
+					}),
+				)
+				.describe("The whole plan, in order."),
+		}),
+		approval: "read",
+		defaultInactive: true,
+		loadMode: "essential",
+		async execute(_toolCallId, params: { tasks: PlanTask[] }) {
+			if (!membership) throw new Error(ISOLATED);
+			if (membership.hub !== null) throw new Error(`Only hubs have a plan; you are an agent of ${membership.hub}.`);
+			const ids = params.tasks.map(task => task.id.trim());
+			const repeated = ids.filter((id, index) => !id || ids.indexOf(id) !== index);
+			if (repeated.length > 0) throw new Error(`Every task needs its own non-empty id; repeated or empty: ${[...new Set(repeated)].join(", ") || "''"}.`);
+			// Some models fill every optional field, so blank values mean "not given".
+			const owners = new Map(swarm.plan(membership.name).map(task => [task.id, task.agent]));
+			const tasks = params.tasks.map((task, index) => {
+				// An owner left out stays: a spawn may have assigned it, under the name the agent joined with.
+				const agent = task.agent?.trim() || owners.get(ids[index]);
+				const after = (task.after ?? []).map(id => id.trim()).filter(Boolean);
+				const unknown = after.filter(id => !ids.includes(id) || id === ids[index]);
+				if (unknown.length > 0) throw new Error(`Task ${ids[index]} waits for ${unknown.join(", ")}, which isn't another task of the plan.`);
+				return { id: ids[index], title: task.title.trim(), ...(agent ? { agent } : {}), ...(after.length > 0 ? { after } : {}), ...(task.done ? { done: true } : {}) };
+			});
+			swarm.setPlan(membership.peer, tasks);
+			const done = tasks.filter(task => task.done).length;
+			return { content: [{ type: "text", text: `Plan set: ${tasks.length} tasks, ${done} done.` }], details: { tasks } };
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_steps",
+		label: "Peer steps",
+		description:
+			"Draw out one of your plan tasks (named in your briefing): the steps you will take and the pieces you will build, a few words each, in order. " +
+			"The swarm view draws them left to right from the task's box, each from the step it continues: the previous one, or the one named in `after` to branch. " +
+			"Replaces that task's steps: call it first for each task, then again whenever a step is done or the work changes. " +
+			"Your hub and the user follow it live, can click a step, and point at it to send you a note; the task is done when all its steps are.",
+		parameters: z.object({
+			task: z.string().describe("The id of one of your tasks, e.g. 't2'."),
+			steps: z
+				.array(
+					z.object({
+						id: z.string().optional().describe("Short and unique within the task, e.g. 's1'; needed only to branch from it."),
+						title: z.string().describe("A few words."),
+						done: z.boolean().optional(),
+						after: z.string().optional().describe("The id of an earlier step this one continues from, to branch; default the previous step."),
+						code: z.string().optional().describe("The code it stands for, as path:line, once you know it."),
+					}),
+				)
+				.describe("All of the task's steps, in order, each marked done when it is."),
+		}),
+		approval: "read",
+		defaultInactive: true,
+		loadMode: "essential",
+		async execute(_toolCallId, params: { task: string; steps: Partial<Step>[] }) {
+			if (!membership) throw new Error(ISOLATED);
+			const hub = membership.hub;
+			if (hub === null) throw new Error("A hub's tasks have no steps; keep your plan current with peer_plan.");
+			const mine = swarm.plan(hub).filter(task => task.agent === membership?.name);
+			const task = mine.find(item => item.id === params.task.trim());
+			if (!task) {
+				throw new Error(`${params.task} isn't one of your tasks; yours: ${mine.map(item => item.id).join(", ") || `none (ask ${hub} to assign you some)`}.`);
+			}
+			// Some models fill every optional field, so blank values mean "not given".
+			const given = params.steps
+				.map(step => ({ ...step, title: (step.title ?? "").replace(/\s+/g, " ").trim(), id: step.id?.trim(), after: step.after?.trim(), code: step.code?.trim() }))
+				.filter(step => step.title);
+			if (given.length === 0) throw new Error("Give the task at least one step.");
+			const ids = given.map((step, index) => step.id || `s${index + 1}`);
+			const repeated = ids.filter((id, index) => ids.indexOf(id) !== index);
+			if (repeated.length > 0) throw new Error(`Every step needs its own id; repeated: ${[...new Set(repeated)].join(", ")}.`);
+			const steps: Step[] = given.map((step, index) => {
+				// Only an earlier step: the drawing stays left to right, without loops.
+				if (step.after && !ids.slice(0, index).includes(step.after)) {
+					throw new Error(`Step ${ids[index]} continues from ${step.after}, which isn't an earlier step of ${task.id}.`);
+				}
+				return {
+					id: ids[index],
+					title: step.title,
+					...(step.done ? { done: true } : {}),
+					...(step.after && step.after !== ids[index - 1] ? { after: step.after } : {}),
+					...(step.code ? { code: step.code } : {}),
+				};
+			});
+			swarm.setSteps(membership.peer, task.id, steps);
+			const done = steps.filter(step => step.done).length;
+			const verdict = done === steps.length ? `${task.id} is done.` : `${done}/${steps.length} done; next: ${steps.find(step => !step.done)?.title}.`;
+			return { content: [{ type: "text", text: `Steps for ${task.id} set. ${verdict}` }], details: { task: task.id, steps } };
+		},
+	});
+
+	pi.registerCommand("swarm-view", {
+		description: "Reopen or focus the swarm view beside this hub: its agents and plan, live (herdr)",
+		handler: async (_args, ctx) => {
+			if (!inHerdr()) return ctx.ui.notify("peer-mail: the swarm view needs this session to run in herdr.", "warning");
+			if (!membership || membership.hub !== null) return ctx.ui.notify("peer-mail: only a hub has a swarm view.", "warning");
+			await showView(true).catch((error: Error) => ctx.ui.notify(`peer-mail: the swarm view didn't open: ${error.message}`, "error"));
 		},
 	});
 
