@@ -20,20 +20,21 @@ function deadPid(): number {
 	return Bun.spawnSync(["true"]).pid;
 }
 
-test("/swarm attaches to the running swarm and can mail the members already there", () => {
+/** A second hub: one only arises from a session rejoining under its earlier place as a hub. */
+function otherHub(lead: Membership): Membership {
+	return Membership.attach(swarm, "agent", "/o", { identity: { phase: lead.peer.phase, label: "s", name: "other", hub: null } });
+}
+
+test("/swarm joins the running swarm as an agent of its lead", () => {
 	const lead = Membership.start(swarm, "project_fix_robot", "lead", "/r");
 	const joiner = Membership.attach(new Swarm(root), "agent", "/r");
+	expect(joiner.hub).toBe("lead");
 
 	expect(swarm.peers().map(peer => peer.name).sort()).toEqual(["agent", "lead"]);
 	expect(swarm.phase()?.label).toBe("project_fix_robot");
 	joiner.send("lead", "I'm in");
 	expect(lead.receive().map(message => [message.from, message.body])).toEqual([["agent", "I'm in"]]);
 	expect(lead.receive()).toEqual([]);
-});
-
-test("/swarm with nothing running is refused rather than starting a swarm", () => {
-	expect(() => Membership.attach(swarm, "agent", "/r")).toThrow(/No swarm is running/);
-	expect(swarm.phase()).toBeUndefined();
 });
 
 test("only members can be addressed", () => {
@@ -104,7 +105,7 @@ test("renaming to a role brings waiting mail along and frees the old name", () =
 
 test("a vertex reaches only its hub; a hub reaches its vertices and other hubs, not their vertices", () => {
 	const lead = Membership.start(swarm, "s", "lead", "/r");
-	const other = Membership.attach(swarm, "other", "/o");
+	const other = otherHub(lead);
 	const reviewer = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
 	const tester = Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "tester", "test", []), "/r");
 	const helper = Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help", []), "/o");
@@ -164,7 +165,7 @@ test("renames keep the plan: a hub keeps its plan, an agent keeps its tasks and 
 test("the graph view draws exactly the edges mail can travel", async () => {
 	const { graphState } = await import("../src/graph");
 	const lead = Membership.start(swarm, "s", "lead", "/r");
-	const other = Membership.attach(swarm, "other", "/o");
+	const other = otherHub(lead);
 	Membership.spawned(swarm, swarm.requestSpawn(lead.peer, "reviewer", "review", []), "/r");
 	Membership.spawned(swarm, swarm.requestSpawn(other.peer, "helper", "help", []), "/o");
 

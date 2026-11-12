@@ -187,6 +187,8 @@ export const STALE_MS = 3 * HEARTBEAT_MS;
 export const HUMAN = "human";
 /** `to` value that sends one copy to every other member. */
 export const BROADCAST = "all";
+/** A join lock older than this was left by a session that died mid-join (a join takes milliseconds). */
+const JOIN_LOCK_STALE_MS = 5_000;
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 // Orders messages one process sends within the same millisecond.
@@ -270,9 +272,42 @@ export class Swarm {
 	/** Delete every member and message and begin a new phase. */
 	start(label: string, by: string): Phase {
 		fs.rmSync(this.dir, { recursive: true, force: true });
-		const phase: Phase = { id: randomUUID(), label, startedAt: Date.now(), startedBy: by };
+		return this.begin(randomUUID(), label, by);
+	}
+
+	/**
+	 * Begin phase `id` without deleting anything: /swarm finding no swarm. Given the id of a phase
+	 * whose mailbox was lost, it brings that swarm back, so its sessions rejoin it.
+	 */
+	begin(id: string, label: string, by: string): Phase {
+		const phase: Phase = { id, label, startedAt: Date.now(), startedBy: by };
 		writeJson(this.path("phase.json"), phase);
 		return phase;
+	}
+
+	/**
+	 * Run `fn` holding the join lock (outside swarm/, so /startswarm can't delete it), so that
+	 * sessions running /swarm at once take turns: only one of them can find no lead and become it.
+	 */
+	exclusive<T>(fn: () => T): T {
+		const lock = path.join(this.root, "join.lock");
+		fs.mkdirSync(this.root, { recursive: true });
+		for (;;) {
+			try {
+				fs.mkdirSync(lock);
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			const since = fs.statSync(lock, { throwIfNoEntry: false })?.mtimeMs;
+			if (since !== undefined && Date.now() - since > JOIN_LOCK_STALE_MS) fs.rmSync(lock, { recursive: true, force: true });
+			else Bun.sleepSync(10);
+		}
+		try {
+			return fn();
+		} finally {
+			fs.rmSync(lock, { recursive: true, force: true });
+		}
 	}
 
 	private requireCurrent(phase: string): void {
@@ -296,6 +331,13 @@ export class Swarm {
 		if (peer.pid === null) return false;
 		if (peer.host === os.hostname()) return pidAlive(peer.pid);
 		return now - peer.seenAt <= STALE_MS;
+	}
+
+	/** The swarm's lead: the running hub that joined first. A /swarm with no place of its own joins it as an agent. */
+	lead(): Peer | undefined {
+		return this.peers()
+			.filter(peer => peer.hub === null && this.isOnline(peer))
+			.sort((a, b) => a.joinedAt - b.joinedAt)[0];
 	}
 
 	/**

@@ -7,7 +7,7 @@ An omp extension that lets omp sessions on one machine message each other throug
 | Command | Does |
 |---|---|
 | `/startswarm [label] <prompt>` | Starts the swarm afresh, deleting its earlier members and mail; joins it; runs `<prompt>`. `[label]` says what the run is for (default: the directory name) |
-| `/swarm <prompt>` | Joins the swarm that is running and runs `<prompt>`; refused if none is running |
+| `/swarm <prompt>` | Joins the swarm and runs `<prompt>`: back in its earlier place if this session was in the swarm before, else as an agent of the swarm's lead; with no hub running, this session becomes the lead (see [When the swarm is lost](#when-the-swarm-is-lost)) |
 | `/swarm` | Shows the swarm and its members |
 | `/swarm-leave` | Leaves the swarm; the session is isolated again |
 | `/swarm-graph` | Opens the graph view in the browser |
@@ -21,7 +21,7 @@ There is one swarm at a time. Roles go in the prompt:
 (terminal 3)  plain omp: isolated, can't see or be reached by the swarm
 ```
 
-Members get `peer_list`, `peer_send`, `peer_rename` and `peer_status`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the agents above become `programmer` and `reviewer`. Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members that aren't finished.
+Members get `peer_list`, `peer_send`, `peer_rename` and `peer_status`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the sessions above become `programmer` (the hub) and `reviewer` (its agent). Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members that aren't finished.
 
 The peer tools load as ordinary top-level tools (`loadMode: "essential"`), not as discoverable `xd://` devices: models whose harness can't write to `xd://` paths (grok through Cursor) could otherwise not call them at all.
 
@@ -62,11 +62,21 @@ When you talk to a spawned agent in its own window, by typing to it or answering
 - `unread`: mail sent to the member that it hasn't received yet, so nobody resends it;
 - `plugin: "old"`: the member loaded older peer-mail code. It still works, just without the newest behaviour, and only you can restart it. Each session records a hash of the plugin's source when it loads (`src/version.ts`); `bun src/cli.ts list` shows the same as `OLD CODE (restart)`.
 
-`/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one.
+`/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one, under their old names, as agents of its lead. `/startswarm [label` without the closing bracket is refused rather than wiping the swarm with the fragment as the prompt.
+
+### When the swarm is lost
+
+Each member keeps its place in its own omp session file (a `peer-mail-identity` entry: the phase and label, its name, its hub, and a hub's plan), rewritten whenever it changes. When the swarm is lost (herdr restarts and closes every pane, sessions are killed, the mailbox is deleted), relaunch the sessions with their conversations (`omp --resume`) and run `/swarm` in each, in any order:
+
+- A session whose swarm is still the current phase rejoins under its earlier name and hub: the hub keeps its plan and its agents, an agent keeps its tasks and steps, and mail sent to the name while it was away is delivered. An agent follows a hub that renamed itself meanwhile, and goes to the lead if its hub is no longer in the swarm at all.
+- With no swarm in the mailbox, the first `/swarm` brings back the swarm its session was in (same phase and label, the hub's plan restored), so the others rejoin it too. A session that was never in one begins a swarm labelled after its directory.
+- Any other session, a new one or one from a swarm `/startswarm` has since replaced, joins the swarm's lead (its running hub that joined first) as one of its agents, keeping its earlier name if it had one. With no hub running, it becomes the lead.
+
+Sessions running `/swarm` at the same moment take turns under a lock, so exactly one of them can become the lead. There is only ever one swarm; `/startswarm` is for starting afresh, not for recovering.
 
 ## Hubs and spawned agents
 
-Sessions you join by hand (`/startswarm`, `/swarm`) are hubs. A hub also gets `peer_spawn`, which opens a new omp session (in herdr, a pane of the swarm's own workspace; otherwise a kitty split beside the hub); that session joins the swarm as one of the hub's agents (a vertex) and starts on the prompt the hub gave it:
+The session that starts the swarm (`/startswarm`, or the first `/swarm` when no hub runs) is a hub, its lead; later `/swarm` sessions are its agents. A hub also gets `peer_spawn`, which opens a new omp session (in herdr, a pane of the swarm's own workspace; otherwise a kitty split beside the hub); that session joins the swarm as one of the hub's agents (a vertex) and starts on the prompt the hub gave it:
 
 ```text
 /startswarm [fix_robot] You are the lead. Spawn a reviewer to check src/arm.rs and tell me what it finds.
@@ -80,7 +90,7 @@ graph LR
   other --- helper[helper]
 ```
 
-Messages follow the edges: a vertex can message only its hub, and a hub can message its own vertices and the other hubs (`human`, from the shell, can message anyone). Spawned agents can't spawn. If a hub renames itself, its vertices follow.
+Messages follow the edges: a vertex can message only its hub, and a hub can message its own vertices and the other hubs (`human`, from the shell, can message anyone). A second hub only arises when a session rejoins under its earlier place as a hub. Agents can't spawn. If a hub renames itself, its vertices follow.
 
 ### In herdr
 
@@ -183,7 +193,7 @@ Everything is files under `~/.omp/peer-mail/` (`PEER_MAIL_DIR` moves it). The sw
 
 The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop waiting runs: `runs/<id>.json` is a queued run (the first one whose session is alive is running), `runs/<id>.mark` is the marker file its processes hold. Tickets of sessions that have died are dropped by the next reader.
 
-`/startswarm` deletes the directory and writes a new phase. Every member action checks its phase against `phase.json`, and peers and messages from another phase are ignored. Members check their inbox every second; a message is received by renaming it from `inbox/` to `delivered/`, so exactly one session gets it.
+`/startswarm` deletes the directory and writes a new phase. Every member action checks its phase against `phase.json`, and peers and messages from another phase are ignored. Members check their inbox every second; a message is received by renaming it from `inbox/` to `delivered/`, so exactly one session gets it. `/swarm` decides its place holding `join.lock` (beside `swarm/`; one left by a session that died mid-join is broken after 5 s).
 
 | File | Does |
 |---|---|

@@ -1,13 +1,34 @@
 /**
  * One session's membership of a swarm: its name, its heartbeat, and its incoming mail.
  */
+import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { currentHerdrPane } from "./herdr";
 import { currentKittyWindow } from "./kitty";
-import { type Activity, type JoinOptions, type Message, type Peer, type SendOptions, type SpawnRequest, Swarm } from "./transport";
+import { type Activity, type JoinOptions, type Message, type Peer, type PlanTask, type SendOptions, type SpawnRequest, Swarm } from "./transport";
 import { LOADED_VERSION } from "./version";
 
 /** How often a member checks its inbox. */
 export const POLL_MS = 1_000;
+
+/**
+ * A member's place in the swarm, which its session keeps in its own session file: after the swarm
+ * is lost (herdr restarted, sessions relaunched, the mailbox gone), /swarm puts it back there.
+ */
+export interface Identity {
+	phase: string;
+	label: string;
+	name: string;
+	hub: string | null;
+	/** A hub's plan, restored if the mailbox lost it. */
+	plan?: PlanTask[];
+}
+
+export interface AttachOptions {
+	/** Where this session was in the swarm before, from its session file. */
+	identity?: Identity;
+	model?: string;
+}
 
 export class Membership {
 	#peer: Peer;
@@ -25,11 +46,30 @@ export class Membership {
 		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { ...place(), model, plugin: LOADED_VERSION }));
 	}
 
-	/** `/swarm`: join the swarm as it is now. Fails when no swarm has been started. */
-	static attach(swarm: Swarm, desiredName: string, cwd: string, model?: string): Membership {
-		const phase = swarm.phase();
-		if (!phase) throw new Error("No swarm is running. Start one with /startswarm.");
-		return new Membership(swarm, swarm.join(desiredName, phase.id, cwd, { ...place(), model, plugin: LOADED_VERSION }));
+	/**
+	 * `/swarm`: join the swarm as it is now. A session that was in this swarm before (`identity`)
+	 * rejoins under its name and hub. Any other session joins the swarm's lead as one of its agents,
+	 * or becomes the lead when no hub is running. With no swarm at all, the session's previous swarm
+	 * comes back (so its other sessions rejoin it), else a new one labelled after `cwd` begins.
+	 */
+	static attach(swarm: Swarm, desiredName: string, cwd: string, { identity, model }: AttachOptions = {}): Membership {
+		return swarm.exclusive(() => {
+			const by = `${identity?.name ?? desiredName} (pid ${process.pid})`;
+			const phase = swarm.phase() ?? (identity ? swarm.begin(identity.phase, identity.label, by) : swarm.begin(randomUUID(), path.basename(cwd), by));
+			const placement = { ...place(), model, plugin: LOADED_VERSION };
+			const lead = swarm.lead();
+			if (identity?.phase !== phase.id) {
+				return new Membership(swarm, swarm.join(identity?.name ?? desiredName, phase.id, cwd, { ...placement, hub: lead?.name ?? null }));
+			}
+			// The entry it left behind going offline follows a hub that has renamed since.
+			const left = swarm.peer(identity.name);
+			const hub = left?.phase === phase.id && !swarm.isOnline(left) ? left.hub : identity.hub;
+			// An agent whose hub is no longer in the swarm goes to the lead instead, if there is one.
+			const kept = hub === null || swarm.peer(hub)?.phase === phase.id || !lead ? hub : lead.name;
+			const member = new Membership(swarm, swarm.join(identity.name, phase.id, cwd, { ...placement, hub: kept }));
+			if (kept === null && identity.plan?.length && swarm.plan(member.name).length === 0) swarm.setPlan(member.peer, identity.plan);
+			return member;
+		});
 	}
 
 	/** A session a hub launched with peer_spawn: join as the vertex its request names. */
@@ -50,6 +90,14 @@ export class Membership {
 	get hub(): string | null {
 		const current = this.swarm.peer(this.name);
 		return current && current.pid === this.#peer.pid ? current.hub : this.#peer.hub;
+	}
+
+	/** What this session keeps in its session file to rejoin the swarm after it is lost. */
+	identity(): Identity {
+		const hub = this.hub;
+		const plan = hub === null ? this.swarm.plan(this.name) : [];
+		const label = this.swarm.phase()?.label ?? "";
+		return { phase: this.#peer.phase, label, name: this.name, hub, ...(plan.length > 0 ? { plan } : {}) };
 	}
 
 	/** The join options that keep this member's place in the graph when it joins again. */

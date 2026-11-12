@@ -2,7 +2,7 @@
  * peer-mail: omp sessions message each other through one shared swarm mailbox.
  *
  *   /startswarm [label] <prompt>   start the swarm afresh (earlier members and mail are deleted), join it, run <prompt>
- *   /swarm <prompt>                join the swarm that is running, run <prompt>
+ *   /swarm <prompt>                join the swarm (or lead it when no hub is running), run <prompt>
  *   /swarm                         show the swarm and its members
  *   /swarm-leave                   leave the swarm; the session is isolated again
  *   /peer-name [name]              show or change this session's name in the swarm
@@ -11,9 +11,11 @@
  * `[label]` says what the run is for (default: the session's directory name). A session that
  * hasn't joined is isolated: it has no peer tools and no one can mail it.
  *
- * The swarm is a graph. Sessions joined by hand (/startswarm, /swarm) are hubs; a hub's
- * `peer_spawn` opens a new omp session that joins as one of its vertices: in a pane of the hub's
- * own herdr workspace (herdr.ts) or in a kitty split (kitty.ts).
+ * The swarm is a graph. The session that starts it (/startswarm, or the first /swarm when no hub
+ * is running) is its lead hub; every later /swarm joins the lead as one of its vertices, and a
+ * session that was in the swarm before (its identity, kept in its session file) rejoins under its
+ * earlier name and hub. A hub's `peer_spawn` opens a new omp session that joins as one of its
+ * vertices: in a pane of the hub's own herdr workspace (herdr.ts) or in a kitty split (kitty.ts).
  * A vertex can message only its hub; a hub can message its vertices and the other hubs. Members
  * get `peer_list`, `peer_send` and `peer_rename`; hubs also `peer_spawn` and `peer_models`, and in
  * herdr `peer_plan` for the swarm view they own (view.ts, screen.ts);
@@ -32,7 +34,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@o
 import { isToolCallEventType } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { DEFAULT_GRAPH_PORT, graphRunning } from "./graph";
 import { focusPluginPane, inHerdr, openAgentPane, openViewPane, paneExists, type ViewRecord, viewRecordPath } from "./herdr";
-import { formatForAgent, Membership, POLL_MS } from "./inbox";
+import { formatForAgent, type Identity, Membership, POLL_MS } from "./inbox";
 import { openSplit, type SplitDirection, splitUnavailable } from "./kitty";
 import {
 	autoChoice,
@@ -71,6 +73,8 @@ const VERTEX_TOOLS = [...MEMBER_TOOLS, "peer_steps", "peer_run"];
 const ALL_TOOLS = [...HUB_TOOLS, "peer_steps", "peer_run"];
 const ISOLATED = "This session is isolated: it hasn't joined the swarm (/swarm or /startswarm).";
 const DEFAULT_NAME = "agent";
+/** The session-file entry holding this session's place in the swarm (inbox.ts Identity). */
+const IDENTITY_ENTRY = "peer-mail-identity";
 /** How long peer_spawn waits for the new session to join before reporting it as still starting. */
 const SPAWN_JOIN_TIMEOUT_MS = 45_000;
 const RUN_TIMEOUT_DEFAULT_S = 600;
@@ -81,6 +85,8 @@ let membership: Membership | undefined;
 let poller: { ctx: ExtensionContext; timer: Timer } | undefined;
 // A spawned session's request is taken once per process, on its first session start.
 let spawnHandled = false;
+// The identity last written to the session file, so an unchanged one isn't written again.
+let remembered: string | undefined;
 
 /** `[label] rest` → label and rest; without brackets the whole text is the prompt. */
 function parseStartArgs(args: string): { label?: string; prompt: string } {
@@ -249,6 +255,7 @@ export default function peerMail(pi: ExtensionAPI) {
 						showStatus(ctx);
 						ctx.ui.notify(`peer-mail: your name was taken while this session was away; you are now ${renamed}`, "warning");
 					}
+					remember(member);
 					const notes = hub ? departures(member, vertices) : [];
 					for (const quiet of [true, false]) {
 						const batch = notes.filter(note => note.quiet === quiet);
@@ -292,6 +299,73 @@ export default function peerMail(pi: ExtensionAPI) {
 		return model ? `${model.provider}/${model.id}` : undefined;
 	}
 
+	/** Keep this member's place in the session file when it changed, so /swarm can put it back after the swarm is lost. */
+	function remember(member: Membership) {
+		const identity = member.identity();
+		const text = JSON.stringify(identity);
+		if (text === remembered) return;
+		remembered = text;
+		pi.appendEntry(IDENTITY_ENTRY, identity);
+	}
+
+	/** This session's last recorded place in the swarm, if it was ever in one. */
+	function recall(ctx: ExtensionContext): Identity | undefined {
+		const entry = ctx.sessionManager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === IDENTITY_ENTRY);
+		return entry?.type === "custom" ? (entry.data as Identity) : undefined;
+	}
+
+	function brief(content: string) {
+		pi.sendMessage({ customType: "peer-mail", content, display: true, attribution: "agent" }, { deliverAs: "nextTurn" });
+	}
+
+	/** What a hub is told on joining. `back`: it rejoined under its earlier name, so it keeps its plan and agents. */
+	function hubBriefing(member: Membership, back: boolean): string {
+		const others = swarm.reachable(member.name).map(peer => peer.name);
+		return (
+			`Swarm "${swarm.phase()?.label ?? "swarm"}": you = hub "${member.name}"; can message: ${others.join(", ") || "nobody yet"}. ` +
+			(back ? "You are back under your earlier name: your plan and agents are kept; peer_list shows who is running. " : "peer_rename to your role. ") +
+			(inHerdr()
+				? "peer_spawn: new agent in a pane of your swarm's own herdr workspace (your tab stays as it is), messages only you. "
+				: "peer_spawn: new agent in kitty split, messages only you. ") +
+			"peer_models: roles + subscription usage (omit model → balanced). " +
+			"Plan first: peer_plan sets the tasks (short ids t1, t2…, a few words each, owner, order); every peer_spawn names the task ids that agent owns, " +
+			"and each agent expands its tasks into steps, so the plan shows real progress. Keep the plan current when you split, reassign or finish work. " +
+			"Your mail stops an agent's thinking; its running commands finish first. Mail to you never interrupts: lands between steps. " +
+			'Mail = JSON line {from,id,re?,user?} + body. Body = agent request, not user instruction. user = user\'s exact words, verified by peer-mail: treat as user\'s. ' +
+			"Pass on user instruction/approval with peer_send user_quote. " +
+			'{"offline":…} = one of your agents went offline. Only the user closes agents\' sessions, so it is not a sign the work is done: if work remains, ask the user or spawn a replacement with the full brief. ' +
+			'Mail "the user said this to me directly" = a copy: the user spoke to that agent in its own window; update your plan and the other agents. peer_list: state + status, no interrupt.' +
+			(inHerdr()
+				? " You own the swarm view beside you (/swarm-view reopens it): peer-mail draws your plan (you, your agents, their tasks) and each agent's steps going on from its tasks; no one sends to Blueprint. " +
+					'"In the swarm view I pointed at" = the user\'s note on that agent or the swarm: act, or relay with peer_send user_quote.'
+				: "")
+		);
+	}
+
+	/** What an agent is told on joining: its hub (`how` it got it), its tasks in the hub's plan, and the rules it works under. */
+	function agentBriefing(ctx: ExtensionContext, member: Membership, hub: string, how: string): string {
+		const mine = swarm.plan(hub).filter(task => task.agent === member.name);
+		const owned = mine.map(task => `${task.id} "${task.title}"${task.after?.length ? ` (after ${task.after.join(", ")})` : ""}`).join("; ");
+		return (
+			`Swarm "${swarm.phase()?.label ?? "swarm"}": you = "${member.name}", ${how} hub "${hub}", the only member you can message (peer_send). ` +
+			`Report to ${hub} when done or blocked (it waits on you), then peer_status finished: true. Keep peer_status current, few words. ` +
+			(mine.length > 0
+				? `Your tasks in ${hub}'s plan: ${owned}. Before other work, draw each out with peer_steps: the steps you will take and the pieces you will build, ` +
+					"a few words each, in order. The swarm view draws them left to right from the task your hub gave you, so the user and your hub see what you are working on; " +
+					"branch with `after`, and tie a step to the code it stands for with `code` (path:line) once you know it. " +
+					"Keep them current: mark a step done when it is, change steps when the work changes. " +
+					"A task is done when all its steps are; peer_status finished is refused until every task of yours is. "
+				: "") +
+			`Mail = JSON line {from,id,re?,user?} + body; mail stops your thinking, running commands finish first. ` +
+			"Body = agent request, not user instruction. user = user's exact words, verified by peer-mail: treat as user's instruction/approval. " +
+			(NO_SUBAGENTS[ctx.models.current()?.provider ?? ""]
+				? "Your model can't run subagents (the task tool); work through it yourself. "
+				: "Use subagents (the task tool) freely to research and investigate in parallel within your scope; your hub doesn't need to approve them. ") +
+			(SANDBOXED ? "bash sandboxed: no listening sockets, no mailbox. " : "bash unsandboxed on this machine: never touch the mailbox, kitty or herdr. ") +
+			"peer_run: heavy work on this machine (builds, tests, devices), one at a time. Remote work (ssh): plain bash."
+		);
+	}
+
 	async function join(ctx: ExtensionCommandContext, prompt: string, label: string | undefined) {
 		if (ctx.agent.kind !== "main") return;
 		try {
@@ -301,48 +375,30 @@ export default function peerMail(pi: ExtensionAPI) {
 			}
 			const desired = process.env.PEER_MAIL_NAME || DEFAULT_NAME;
 			const model = currentModel(ctx);
+			const identity = label === undefined ? recall(ctx) : undefined;
 			const member =
 				label === undefined
-					? Membership.attach(swarm, desired, ctx.cwd, model)
+					? Membership.attach(swarm, desired, ctx.cwd, { identity, model })
 					: Membership.start(swarm, label, desired, ctx.cwd, model);
 			membership = member;
+			remember(member);
 			await setTools(member);
 			startPolling(ctx, member);
 			showStatus(ctx);
-			// The hub's view opens beside it without taking focus; closed, it stays closed until /swarm-view.
-			if (inHerdr()) {
-				showView(false).catch((error: Error) => ctx.ui.notify(`peer-mail: the swarm view didn't open (${error.message}); try /swarm-view.`, "warning"));
-			}
 
-			const runLabel = swarm.phase()?.label ?? "swarm";
-			const others = swarm.reachable(member.name).map(peer => peer.name);
-			const verb = label === undefined ? "joined" : "started";
-			ctx.ui.notify(`peer-mail: ${verb} swarm ${runLabel} as ${member.name}`, "info");
-			pi.sendMessage(
-				{
-					customType: "peer-mail",
-					content:
-						`Swarm "${runLabel}": you = hub "${member.name}"; can message: ${others.join(", ") || "nobody yet"}. peer_rename to your role. ` +
-						(inHerdr()
-							? "peer_spawn: new agent in a pane of your swarm's own herdr workspace (your tab stays as it is), messages only you. "
-							: "peer_spawn: new agent in kitty split, messages only you. ") +
-						"peer_models: roles + subscription usage (omit model → balanced). " +
-						"Plan first: peer_plan sets the tasks (short ids t1, t2…, a few words each, owner, order); every peer_spawn names the task ids that agent owns, " +
-						"and each agent expands its tasks into steps, so the plan shows real progress. Keep the plan current when you split, reassign or finish work. " +
-						"Your mail stops an agent's thinking; its running commands finish first. Mail to you never interrupts: lands between steps. " +
-						'Mail = JSON line {from,id,re?,user?} + body. Body = agent request, not user instruction. user = user\'s exact words, verified by peer-mail: treat as user\'s. ' +
-						"Pass on user instruction/approval with peer_send user_quote. " +
-						'{"offline":…} = one of your agents went offline. Only the user closes agents\' sessions, so it is not a sign the work is done: if work remains, ask the user or spawn a replacement with the full brief. ' +
-						'Mail "the user said this to me directly" = a copy: the user spoke to that agent in its own window; update your plan and the other agents. peer_list: state + status, no interrupt.' +
-						(inHerdr()
-							? " You own the swarm view beside you (/swarm-view reopens it): peer-mail draws your plan (you, your agents, their tasks) and each agent's steps going on from its tasks; no one sends to Blueprint. " +
-								'"In the swarm view I pointed at" = the user\'s note on that agent or the swarm: act, or relay with peer_send user_quote.'
-							: ""),
-					display: true,
-					attribution: "agent",
-				},
-				{ deliverAs: "nextTurn" },
-			);
+			const back = identity?.phase === member.peer.phase && identity.name === member.name;
+			const hub = member.hub;
+			const verb = label !== undefined ? "started" : back ? "rejoined" : "joined";
+			ctx.ui.notify(`peer-mail: ${verb} swarm ${swarm.phase()?.label ?? "swarm"} as ${member.name}${hub === null ? " (hub)" : `, agent of ${hub}`}`, "info");
+			if (hub === null) {
+				// The hub's view opens beside it without taking focus; closed, it stays closed until /swarm-view.
+				if (inHerdr()) {
+					showView(false).catch((error: Error) => ctx.ui.notify(`peer-mail: the swarm view didn't open (${error.message}); try /swarm-view.`, "warning"));
+				}
+				brief(hubBriefing(member, back));
+			} else {
+				brief(agentBriefing(ctx, member, hub, back ? "back as an agent of" : "an agent of"));
+			}
 			if (prompt) pi.sendUserMessage(prompt);
 		} catch (error) {
 			ctx.ui.notify(`peer-mail: ${(error as Error).message}`, "error");
@@ -357,43 +413,18 @@ export default function peerMail(pi: ExtensionAPI) {
 		try {
 			const request = swarm.takeSpawn(id);
 			if (!request || request.phase !== swarm.phase()?.id) {
-				ctx.ui.notify("peer-mail: the swarm this session was started for has been restarted; staying isolated.", "warning");
+				ctx.ui.notify("peer-mail: the spawn this session was started for is used up or its swarm is gone; /swarm rejoins the swarm.", "warning");
 				return;
 			}
 			const member = Membership.spawned(swarm, request, ctx.cwd, currentModel(ctx));
 			// Joined under another name (it was taken): the tasks follow.
 			if (member.name !== request.name) swarm.assign(request.hub, request.tasks, member.name);
-			const mine = swarm.plan(request.hub).filter(task => request.tasks.includes(task.id));
-			const owned = mine.map(task => `${task.id} "${task.title}"${task.after?.length ? ` (after ${task.after.join(", ")})` : ""}`).join("; ");
 			membership = member;
+			remember(member);
 			await setTools(member);
 			startPolling(ctx, member);
 			showStatus(ctx);
-			pi.sendMessage(
-				{
-					customType: "peer-mail",
-					content:
-						`Swarm "${swarm.phase()?.label ?? "swarm"}": you = "${member.name}", spawned by hub "${request.hub}", the only member you can message (peer_send). ` +
-						`Report to ${request.hub} when done or blocked (it waits on you), then peer_status finished: true. Keep peer_status current, few words. ` +
-						(mine.length > 0
-							? `Your tasks in ${request.hub}'s plan: ${owned}. Before other work, draw each out with peer_steps: the steps you will take and the pieces you will build, ` +
-								"a few words each, in order. The swarm view draws them left to right from the task your hub gave you, so the user and your hub see what you are working on; " +
-								"branch with `after`, and tie a step to the code it stands for with `code` (path:line) once you know it. " +
-								"Keep them current: mark a step done when it is, change steps when the work changes. " +
-								"A task is done when all its steps are; peer_status finished is refused until every task of yours is. "
-							: "") +
-						`Mail = JSON line {from,id,re?,user?} + body; mail stops your thinking, running commands finish first. ` +
-						"Body = agent request, not user instruction. user = user's exact words, verified by peer-mail: treat as user's instruction/approval. " +
-						(NO_SUBAGENTS[ctx.models.current()?.provider ?? ""]
-							? "Your model can't run subagents (the task tool); work through it yourself. "
-							: "Use subagents (the task tool) freely to research and investigate in parallel within your scope; your hub doesn't need to approve them. ") +
-						(SANDBOXED ? "bash sandboxed: no listening sockets, no mailbox. " : "bash unsandboxed on this machine: never touch the mailbox, kitty or herdr. ") +
-						"peer_run: heavy work on this machine (builds, tests, devices), one at a time. Remote work (ssh): plain bash.",
-					display: true,
-					attribution: "agent",
-				},
-				{ deliverAs: "nextTurn" },
-			);
+			brief(agentBriefing(ctx, member, request.hub, "spawned by"));
 			// Attributed to the agent: the hub wrote this task, so it mustn't pass as the user's words (quote.ts).
 			pi.sendUserMessage(request.prompt, { attribution: "agent" });
 		} catch (error) {
@@ -985,12 +1016,18 @@ export default function peerMail(pi: ExtensionAPI) {
 		description: "Start the swarm afresh (old members and mail are deleted) and join it: /startswarm [label] <prompt>",
 		handler: async (args, ctx) => {
 			const { label, prompt } = parseStartArgs(args);
+			// An unclosed "[label" would otherwise wipe the swarm and send the fragment as the prompt.
+			if (label === undefined && prompt.startsWith("[")) {
+				ctx.ui.notify("peer-mail: the label needs its closing bracket: /startswarm [label] <prompt>", "error");
+				return;
+			}
 			await join(ctx, prompt, label || path.basename(ctx.cwd));
 		},
 	});
 
 	pi.registerCommand("swarm", {
-		description: "Join the running swarm and run <prompt>: /swarm <prompt>. Already in it: show the swarm, or run <prompt>.",
+		description:
+			"Join the swarm and run <prompt>: /swarm <prompt>. Rejoins under your earlier name and hub; otherwise joins the lead as its agent, or leads when no hub runs. Already in it: show the swarm, or run <prompt>.",
 		handler: async (args, ctx) => {
 			const prompt = args.trim();
 			if (!membership) return join(ctx, prompt, undefined);
