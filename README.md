@@ -1,25 +1,30 @@
 # peer-mail
 
-An omp extension that lets omp sessions on one machine message each other through one shared swarm mailbox. A session that hasn't joined the swarm is isolated: it has no peer tools, and no one can message it.
+An omp extension that lets omp sessions on one machine message each other through a shared mailbox of swarms. A session that hasn't joined a swarm is isolated: it has no peer tools, and no one can message it.
 
 ## Commands
 
 | Command | Does |
 |---|---|
-| `/startswarm [label] <prompt>` | Starts the swarm afresh, deleting its earlier members and mail; joins it; runs `<prompt>`. `[label]` says what the run is for (default: the directory name) |
-| `/swarm <prompt>` | Joins the swarm and runs `<prompt>`: back in its earlier place if this session was in the swarm before, else as an agent of the swarm's lead; with no hub running, this session becomes the lead (see [When the swarm is lost](#when-the-swarm-is-lost)) |
-| `/swarm` | Shows the swarm and its members |
+| `/startswarm [label] <prompt>` | Starts the swarm `label` afresh, deleting its earlier members and mail (other swarms keep running); joins it; runs `<prompt>`. `[label]` names the swarm and says what the run is for (default: the directory name) |
+| `/swarm [label] <prompt>` | Joins the swarm `label` and runs `<prompt>`: back in its earlier place if this session was in that swarm before, else as an agent of its lead; with no hub running, this session becomes the lead (see [When the swarm is lost](#when-the-swarm-is-lost)). Already in another swarm: moves to this one |
+| `/swarm <prompt>` | The same, for the swarm this session was in before; else the one swarm running (or, with none running, the one there is). With several to choose from it names them and asks for a label |
+| `/swarm` | Shows the swarm, its members and the other swarms |
 | `/swarm-leave` | Leaves the swarm; the session is isolated again |
 | `/swarm-graph` | Opens the graph view in the browser |
 | `/peer-name [name]` | Shows or changes this session's name in the swarm |
 
-There is one swarm at a time. Roles go in the prompt:
+Swarms run side by side, each named by its label: a member mails only within its own swarm, and `/startswarm` touches only the swarm it names. Roles go in the prompt:
 
 ```text
-(terminal 1)  /startswarm [project_fix_robot] You are the programmer. Fix the gripper timeout in src/arm.rs and ask the reviewer to check it.
-(terminal 2)  /swarm You are the reviewer. Review what the programmer sends you and reply with problems you find.
-(terminal 3)  plain omp: isolated, can't see or be reached by the swarm
+(terminal 1)  /startswarm [2.0.0] You are the programmer. Fix the gripper timeout in src/arm.rs and ask the reviewer to check it.
+(terminal 2)  /swarm [2.0.0] You are the reviewer. Review what the programmer sends you and reply with problems you find.
+(terminal 3)  /startswarm [3.0.0] You lead the 3.0.0 release work.   (2.0.0 keeps running)
+(terminal 4)  /swarm [3.0.0] You are the tester.                     (an agent of terminal 3)
+(terminal 5)  plain omp: isolated, can't see or be reached by any swarm
 ```
+
+A label becomes the swarm's name the way member names do: lowercased, other characters turned into `-` (`[Fix Robot]` is the swarm `fix-robot`), so `/swarm [fix robot]` finds it too.
 
 Members get `peer_list`, `peer_send`, `peer_rename` and `peer_status`. A member joins as `agent` (`agent-2`, … when taken, or `PEER_MAIL_NAME`) and is told to rename itself after its role, so the sessions above become `programmer` (the hub) and `reviewer` (its agent). Mail to a member that isn't running waits until a session rejoins under that name; `peer_send` says when its recipient is offline. A broadcast (`all`) reaches only running members that aren't finished.
 
@@ -29,6 +34,7 @@ How mail lands depends on who receives it:
 
 - **A hub is never interrupted.** Mail to it arrives between its steps (after the tools in flight finish), or starts a turn when it is idle. Its question boxes, commands, subagents and background jobs are left alone.
 - **A spawned agent's thinking is stopped.** If the agent is thinking, the turn is aborted and the mail starts a new one. If it is running a command or any other tool (including a question box or a `peer_run` waiting in line), the tool finishes first, and the mail arrives before its next thinking step. Background jobs are never cancelled.
+- **`peer_interrupt` stops a spawned agent outright.** A hub's `peer_interrupt` (its own agents only) aborts everything the agent is doing, running commands and a `peer_run` included, then delivers the hub's message as its next instruction; without one, the agent is told to stop and wait. The message's header carries `"interrupt":true`, and the agent's briefing says what that means: don't resume, stop the background jobs you started (peer-mail can't cancel those for it), follow the message. Use it for an agent that is stuck, looping or on the wrong track; `peer_send` is for changes that can wait for the running command.
 
 Mail reaches the agent as one JSON line and the body:
 
@@ -62,17 +68,17 @@ When you talk to a spawned agent in its own window, by typing to it or answering
 - `unread`: mail sent to the member that it hasn't received yet, so nobody resends it;
 - `plugin: "old"`: the member loaded older peer-mail code. It still works, just without the newest behaviour, and only you can restart it. Each session records a hash of the plugin's source when it loads (`src/version.ts`); `bun src/cli.ts list` shows the same as `OLD CODE (restart)`.
 
-`/startswarm` begins a new phase. Sessions still in the old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one, under their old names, as agents of its lead. `/startswarm [label` without the closing bracket is refused rather than wiping the swarm with the fragment as the prompt.
+`/startswarm` begins a new phase of its swarm. Sessions still in that swarm's old phase are told they are no longer in the swarm, lose their peer tools, and can't send or receive; `/swarm` puts them in the new one, under their old names, as agents of its lead. Other swarms are untouched. `/startswarm [label` without the closing bracket is refused rather than wiping a swarm with the fragment as the prompt (`/swarm [label` likewise).
 
 ### When the swarm is lost
 
 Each member keeps its place in its own omp session file (a `peer-mail-identity` entry: the phase and label, its name, its hub, and a hub's plan), rewritten whenever it changes. When the swarm is lost (herdr restarts and closes every pane, sessions are killed, the mailbox is deleted), relaunch the sessions with their conversations (`omp --resume`) and run `/swarm` in each, in any order:
 
 - A session whose swarm is still the current phase rejoins under its earlier name and hub: the hub keeps its plan and its agents, an agent keeps its tasks and steps, and mail sent to the name while it was away is delivered. An agent follows a hub that renamed itself meanwhile, and goes to the lead if its hub is no longer in the swarm at all.
-- With no swarm in the mailbox, the first `/swarm` brings back the swarm its session was in (same phase and label, the hub's plan restored), so the others rejoin it too. A session that was never in one begins a swarm labelled after its directory.
+- With that swarm gone from the mailbox, the first `/swarm` brings back the swarm its session was in (same phase and label, the hub's plan restored), so the others rejoin it too. A session that was never in one joins the one swarm running, or begins a swarm labelled after its directory when there is none.
 - Any other session, a new one or one from a swarm `/startswarm` has since replaced, joins the swarm's lead (its running hub that joined first) as one of its agents, keeping its earlier name if it had one. With no hub running, it becomes the lead.
 
-Sessions running `/swarm` at the same moment take turns under a lock, so exactly one of them can become the lead. There is only ever one swarm; `/startswarm` is for starting afresh, not for recovering.
+Sessions running `/swarm` at the same moment take turns under a lock, so exactly one of them can become the lead of a swarm. `/startswarm` is for starting a swarm afresh, not for recovering; `/swarm [label]` joins a running one.
 
 ## Hubs and spawned agents
 
@@ -129,9 +135,11 @@ A hub in herdr owns a live view of its swarm, in a pane to the right of its own:
 
 - It opens by itself when a hub in herdr starts or joins the swarm, without taking focus; a view already open in that workspace is pointed at the new hub instead. Close it (`q`) and it stays closed; `/swarm-view` reopens it (or focuses it).
 - It looks like Blueprint because it is Blueprint: a Markdown document with the swarm's summary, a Mermaid diagram drawn by termaid, and a table of the agents (status, current step, model, mail). The diagram is drawn in two parts, both left to right. The hub's part comes from its plan: the hub, its agents, and the tasks it gave each (`t1`, `t2`, …), with an arrow from each task to the tasks that wait for it; tasks the hub keeps (unassigned, or assigned to itself) hang off the hub on a dashed arrow, and an agent the plan names but that hasn't been spawned shows as "not started". Each agent's part goes on from its task's box: the steps it drew the task out into with `peer_steps` (`✓` done, `▸` next), in the task's row, a branch (`after`) on the row below, and steps tied to code with `code` carry a `%% code:` line like any Blueprint diagram (so `c` in point mode opens that code). Each task's boxes stay in its agent's rows: peer-mail places every box itself and termaid routes the arrows.
+- A big swarm folds its oldest work so the diagram stays drawable: Blueprint draws a diagram of at most 10,000 characters and shows a longer one as text, so past 8,000 the view leaves out, one at a time and oldest first in the plan's order, the steps of done tasks, then agents that aren't working and whose tasks are all done (one box, `name · finished · ✓ 3 tasks`), then the done steps of open tasks, and last the steps of open tasks, until it fits. The summary line says what was folded; clicking a folded box still shows all of it.
 - A new version changes only what changed: blocks of the page whose text is the same stay as they are (a status that only shows in the table leaves the diagram alone), the page keeps its scroll position and point-mode selection, and a new diagram is drawn before it is swapped in, so it never flashes Blueprint's "Drawing diagram…" placeholder. A change that leaves the diagram as it was (the table's Now column changes with every tool call) goes up at most every 2 s. A swarm that doesn't change draws nothing.
 - What moves is drawn over the finished diagram, so the layout never shifts, and only for a moment after a change, so the page stays free for scrolling and clicks: an agent's box pulses (reverse, then bright, then back) when its state, status, tasks or mail change; a task or step that gets done flashes; mail between the hub and an agent runs as a dot along the arrow joining them. While agents work, a spinner in the header says how many (`⠙ 3 working`). Between changes boxes keep their state's colour: working agents and their next step in the warning colour, finished agents and done tasks and steps in the success colour, offline agents in the error colour, agents not started and tasks still waiting muted.
 - Click a box (a task, a step, an agent or the hub) to see what it stands for: its owner, progress and steps, and the brief the hub spawned its agent with. A click beside the boxes does nothing. In point mode (`e`, then `hjkl`), a click selects the box under it and `i` shows the same details for the selected box.
+- The wheel scrolls the page; press and drag moves it in any direction (sideways, a diagram wider than the pane), and the end of a drag isn't a click. `-` and `+` (or ctrl+wheel) zoom the drawing out and in, `0` back: zooming out shortens the labels and tightens the layout, down to a bird's-eye view where steps are just their marks (`✓`, `▸`, `·`), tasks their ids and agents their names; zooming in lengthens them and spaces the boxes out. A big diagram stays responsive: moving the pointer over it costs nothing, and an animation frame re-renders only the lines it changed.
 - Point mode's notes go to the hub, the agent beside the view: Enter types "In the swarm view I pointed at agent "tester" (working; tasks: t2). Act on it, or pass it on to tester with peer_send user_quote." and your words into the hub's prompt.
 - Blueprint's other keys work as in Blueprint (`hjkl`, `g`/`G`, `ctrl+d`/`ctrl+u`, `t` theme, `r` reload, `q` quit). What doesn't fit a swarm view is off in it: asking the agent beside it to draw (`a`), editing the document's text (the second `e`), and opening a file (`o`), which the swarm's next change would replace.
 - The view is the herdr plugin in this directory (`herdr-plugin.toml`, pane `view`, running `uv run --project view python -m herdr_blueprint swarm` with `PEER_MAIL_VIEW` naming its record and `BLUEPRINT_SOURCE_PANE` the hub's pane). Which pane shows a workspace's view, and which hub it follows (by pid, so a renamed hub keeps it), is recorded in `~/.omp/peer-mail/views/`. `view/README.md` says what changed from Blueprint.
@@ -146,7 +154,7 @@ A spawned agent is locked down so it can't set up its own way to reach other age
 
 - Its `bash` runs in a sandbox: `sandbox-exec` on macOS, landlock plus a seccomp filter (no `bind` or `listen`) on Linux. Nothing can listen on a socket (TCP, UDP or unix), and nothing can read or write the peer-mail directory, so neither the mailbox files nor `src/cli.ts` work. It can't reach kitty's remote-control socket or herdr's API sockets (`herdr.sock`, `herdr-client.sock` and the session's `HERDR_SOCKET_PATH`; through herdr it could type into the hub's pane), on Linux only where unprivileged user namespaces are allowed; see below. herdr's SSH agent socket stays reachable, so `ssh` still authenticates. macOS also blocks the graph view's port; Linux does not (a filter that denies one outbound TCP port would deny the rest). The kitty, herdr and peer-mail environment variables are removed. Outbound network, the repo and everything else work. Linux needs `python3` on PATH.
 - A sandboxed command reads as `<dir>/sandbox-<hash> '<command>'`, with `<dir>` = `/tmp/peer-mail-<uid>` on macOS and `~/.omp/peer-mail-sandbox-<uid>` on Linux. The script holds the profile, which used to be spelled out inline in every command. The script directory is private to you, and the sandbox can't write to it.
-- It has no `eval` (kernels can't be sandboxed), and `bash` can't start long-lived services (`name`/`ready`).
+- It has no `eval` (kernels can't be sandboxed), and `bash` can't start long-lived services (`name`/`ready`). Its commands run an hour at most: `bash`'s `timeout: 0` (no deadline) becomes an hour, as `peer_run`'s limit already is.
 - Its other tools (`read`, `write`, `grep`, …) are refused if their arguments name the peer-mail directory or the sandbox's directory.
 - Its subagents are held to the same rules.
 
@@ -156,7 +164,7 @@ Heavy work on this machine goes through `peer_run`, the machine-wide run queue: 
 
 `/swarm-graph` opens a page in your browser that draws the swarm live: hubs, their agents, and the edges mail can travel. Members that aren't running are drawn hollow, a badge shows mail waiting, edges light up when a message crosses them, and recent mail is listed on the right. Click a running member to bring its herdr pane (`herdr agent focus`) or its kitty window to the front; drag members to arrange them.
 
-The page is served by `bun src/cli.ts graph` on `http://127.0.0.1:7577/` (`PEER_MAIL_GRAPH_PORT` changes it), which `/swarm-graph` starts in the background. It stops by itself a minute after the page is closed.
+The page is served by `bun src/cli.ts graph` on `http://127.0.0.1:7577/` (`PEER_MAIL_GRAPH_PORT` changes it), which `/swarm-graph` starts in the background. One server draws any swarm: `/swarm-graph` opens it on the session's own (`?swarm=2.0.0`); without that it draws the latest started. It stops by itself a minute after the page is closed.
 
 ## Install
 
@@ -172,14 +180,14 @@ New omp sessions load it; restart running ones.
 ## From a shell
 
 ```bash
-bun src/cli.ts list                        # the swarm's label, members online or not, mail waiting
-bun src/cli.ts send reviewer "status?"     # message a member as "human"
-bun src/cli.ts history reviewer            # what a member has received
+bun src/cli.ts list                                  # every swarm: its label, members online or not, mail waiting
+bun src/cli.ts send --swarm 2.0.0 reviewer "status?" # message a member as "human" (--swarm needed when there are several)
+bun src/cli.ts history --swarm 2.0.0 reviewer        # what a member has received
 ```
 
 ## How it works
 
-Everything is files under `~/.omp/peer-mail/` (`PEER_MAIL_DIR` moves it). The swarm lives in `swarm/`:
+Everything is files under `~/.omp/peer-mail/` (`PEER_MAIL_DIR` moves it). Each swarm lives in `swarms/<name>/`:
 
 | Path | Holds |
 |---|---|
@@ -193,7 +201,9 @@ Everything is files under `~/.omp/peer-mail/` (`PEER_MAIL_DIR` moves it). The sw
 
 The run queue lives beside it, in `runs/`, so restarting the swarm doesn't drop waiting runs: `runs/<id>.json` is a queued run (the first one whose session is alive is running), `runs/<id>.mark` is the marker file its processes hold. Tickets of sessions that have died are dropped by the next reader.
 
-`/startswarm` deletes the directory and writes a new phase. Every member action checks its phase against `phase.json`, and peers and messages from another phase are ignored. Members check their inbox every second; a message is received by renaming it from `inbox/` to `delivered/`, so exactly one session gets it. `/swarm` decides its place holding `join.lock` (beside `swarm/`; one left by a session that died mid-join is broken after 5 s).
+`/startswarm` deletes its swarm's directory and writes a new phase. Every member action checks its phase against its swarm's `phase.json`, and peers and messages from another phase are ignored. Members check their inbox every second; a message is received by renaming it from `inbox/` to `delivered/`, so exactly one session gets it. `/swarm` decides its place holding `join.lock` (beside `swarms/`; one left by a session that died mid-join is broken after 5 s). A spawned agent finds its swarm by the spawn request its hub left (`PEER_MAIL_SPAWN` names it).
+
+Older peer-mail kept its one swarm in `swarm/`. Until none of its members runs, newer sessions use it right there, under its label's name (`/swarm [2.0.0]` joins it, alongside the sessions on older code); after that it moves to `swarms/<its name>/` the first time a session looks for swarms.
 
 | File | Does |
 |---|---|

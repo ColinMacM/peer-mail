@@ -1,11 +1,12 @@
 /**
- * The graph view: a page on 127.0.0.1 that draws the swarm (hubs, their agents, the edges mail can
- * travel) live from the mail directory. Clicking a member brings its omp session's kitty window or
- * herdr pane to the front. The server stops by itself once no page has asked it anything for IDLE_EXIT_MS.
+ * The graph view: a page on 127.0.0.1 that draws a swarm (hubs, their agents, the edges mail can
+ * travel) live from the mail directory: the one its `?swarm=` names, else the latest started.
+ * Clicking a member brings its omp session's kitty window or herdr pane to the front. The server
+ * stops by itself once no page has asked it anything for IDLE_EXIT_MS.
  */
 import { focusPane } from "./herdr";
 import { focusWindow } from "./kitty";
-import { type Message, Swarm } from "./transport";
+import { defaultRoot, type Message, normalizeName, Swarm } from "./transport";
 
 export const DEFAULT_GRAPH_PORT = Number(process.env.PEER_MAIL_GRAPH_PORT) || 7577;
 /** The page polls every 1.5 s, so a minute of silence means no page is open. */
@@ -49,8 +50,19 @@ export function graphState(swarm: Swarm): GraphState {
 	return { label: phase?.label ?? null, startedAt: phase?.startedAt ?? null, nodes, edges, messages };
 }
 
-/** Serve the graph view on `port` until no page has polled it for a minute. */
-export function serveGraph(swarm: Swarm, port = DEFAULT_GRAPH_PORT): void {
+/** The swarm a request's `?swarm=` names (a name, never a path), else the latest started. */
+function requested(url: URL, root: string): Swarm | undefined {
+	const name = url.searchParams.get("swarm");
+	if (!name) return Swarm.all(root).at(-1);
+	try {
+		return new Swarm(root, normalizeName(name));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Serve the graph view of the mailbox at `root` on `port` until no page has polled it for a minute. */
+export function serveGraph(root = defaultRoot(), port = DEFAULT_GRAPH_PORT): void {
 	const page = Bun.file(new URL("./graph.html", import.meta.url));
 	let lastRequest = Date.now();
 	const server = Bun.serve({
@@ -61,7 +73,11 @@ export function serveGraph(swarm: Swarm, port = DEFAULT_GRAPH_PORT): void {
 			const url = new URL(request.url);
 			if (url.pathname === "/") return new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } });
 			if (url.pathname === "/health") return Response.json({ ok: true, app: "peer-mail-graph" });
-			if (url.pathname === "/state") return Response.json(graphState(swarm));
+			const swarm = requested(url, root);
+			if (url.pathname === "/state") {
+				return Response.json(swarm ? graphState(swarm) : ({ label: null, startedAt: null, nodes: [], edges: [], messages: [] } satisfies GraphState));
+			}
+			if (!swarm) return Response.json({ error: "No such swarm." }, { status: 404 });
 			const focus = /^\/focus\/([^/]+)$/.exec(url.pathname);
 			if (focus && request.method === "POST") {
 				const peer = swarm.peer(decodeURIComponent(focus[1]));

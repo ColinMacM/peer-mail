@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { type Identity, Membership } from "../src/inbox";
+import { chooseSwarm, type Identity, Membership } from "../src/inbox";
 import { Swarm } from "../src/transport";
 
 let root: string;
@@ -10,7 +10,7 @@ let swarm: Swarm;
 
 beforeEach(() => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "peer-mail-"));
-	swarm = new Swarm(root);
+	swarm = new Swarm(root, "run");
 });
 
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -83,7 +83,7 @@ test("when the mailbox itself is gone, the swarm comes back as the one the sessi
 
 test("a session from a swarm since replaced by /startswarm joins the new one's lead under its old name", () => {
 	const before = crashedSwarm();
-	const lead = Membership.start(new Swarm(root), "fresh", "lead", "/r");
+	const lead = Membership.start(new Swarm(root, "run"), "fresh", "lead", "/r");
 
 	const scout = Membership.attach(swarm, "agent", "/r", { identity: before.scout });
 	expect([scout.name, scout.hub]).toEqual(["scout", lead.name]);
@@ -96,4 +96,21 @@ test("a relaunched agent follows its hub's rename made while it was away", () =>
 
 	const scout = Membership.attach(swarm, "agent", "/r", { identity: before.scout });
 	expect(scout.hub).toBe("lead");
+});
+
+test("/swarm without a label: its earlier swarm, else the one running, else asks which of several", () => {
+	const identity = (label: string): Identity => ({ phase: "p", label, name: "x", hub: null });
+	// Nothing yet: a swarm named after the directory.
+	expect(chooseSwarm(root, "/home/me/Robot Arm", undefined, undefined).name).toBe("robot-arm");
+	const two = Membership.start(Swarm.named("2.0.0", root), "2.0.0", "hub2", "/r");
+	expect(chooseSwarm(root, "/r", undefined, undefined).name).toBe("2.0.0");
+	const three = Membership.start(Swarm.named("3.0.0", root), "3.0.0", "hub3", "/r");
+	expect(() => chooseSwarm(root, "/r", undefined, undefined)).toThrow("Several swarms are running: 2.0.0, 3.0.0. Join one with /swarm [label].");
+	// Its earlier swarm, even when another is running and that one isn't; a label always wins.
+	two.leave("closed");
+	expect(chooseSwarm(root, "/r", undefined, undefined).name).toBe("3.0.0");
+	expect(chooseSwarm(root, "/r", undefined, identity("2.0.0")).name).toBe("2.0.0");
+	expect(chooseSwarm(root, "/r", "2.0.0", identity("3.0.0")).name).toBe("2.0.0");
+	three.leave("closed");
+	expect(() => chooseSwarm(root, "/r", undefined, undefined)).toThrow("There are several swarms: 2.0.0, 3.0.0.");
 });

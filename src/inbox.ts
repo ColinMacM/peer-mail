@@ -5,7 +5,17 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { currentHerdrPane } from "./herdr";
 import { currentKittyWindow } from "./kitty";
-import { type Activity, type JoinOptions, type Message, type Peer, type PlanTask, type SendOptions, type SpawnRequest, Swarm } from "./transport";
+import {
+	type Activity,
+	type JoinOptions,
+	type Message,
+	normalizeName,
+	type Peer,
+	type PlanTask,
+	type SendOptions,
+	type SpawnRequest,
+	Swarm,
+} from "./transport";
 import { LOADED_VERSION } from "./version";
 
 /** How often a member checks its inbox. */
@@ -24,10 +34,39 @@ export interface Identity {
 	plan?: PlanTask[];
 }
 
+/** The swarm a label names, or undefined when it can't name one. */
+export function swarmName(label: string): string | undefined {
+	try {
+		return normalizeName(label);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The swarm a /swarm in `cwd` joins: the one `label` names; without one, the swarm this session
+ * was in before (`identity`), else the one swarm running (or, with none running, the one there
+ * is), else a new one named after the directory. Several to choose from is an error naming them.
+ */
+export function chooseSwarm(root: string, cwd: string, label: string | undefined, identity: Identity | undefined): Swarm {
+	if (label) return Swarm.named(label, root);
+	const earlier = identity && swarmName(identity.label);
+	if (earlier) return new Swarm(root, earlier);
+	const swarms = Swarm.all(root);
+	const running = swarms.filter(swarm => swarm.lead());
+	const choices = running.length > 0 ? running : swarms;
+	if (choices.length === 1) return choices[0];
+	if (choices.length === 0) return Swarm.named(path.basename(cwd), root);
+	const labels = choices.map(swarm => swarm.phase()?.label ?? swarm.name).join(", ");
+	throw new Error(`${running.length > 0 ? "Several swarms are running" : "There are several swarms"}: ${labels}. Join one with /swarm [label].`);
+}
+
 export interface AttachOptions {
-	/** Where this session was in the swarm before, from its session file. */
+	/** Where this session was in this swarm before, from its session file. */
 	identity?: Identity;
 	model?: string;
+	/** The label a swarm that hasn't begun gets (default: the directory name). */
+	label?: string;
 }
 
 export class Membership {
@@ -47,15 +86,15 @@ export class Membership {
 	}
 
 	/**
-	 * `/swarm`: join the swarm as it is now. A session that was in this swarm before (`identity`)
+	 * `/swarm`: join `swarm` as it is now. A session that was in this swarm before (`identity`)
 	 * rejoins under its name and hub. Any other session joins the swarm's lead as one of its agents,
-	 * or becomes the lead when no hub is running. With no swarm at all, the session's previous swarm
-	 * comes back (so its other sessions rejoin it), else a new one labelled after `cwd` begins.
+	 * or becomes the lead when no hub is running. When the swarm hasn't begun, the session's previous
+	 * phase of it comes back (so its other sessions rejoin it), else a new one labelled `label` begins.
 	 */
-	static attach(swarm: Swarm, desiredName: string, cwd: string, { identity, model }: AttachOptions = {}): Membership {
+	static attach(swarm: Swarm, desiredName: string, cwd: string, { identity, model, label }: AttachOptions = {}): Membership {
 		return swarm.exclusive(() => {
 			const by = `${identity?.name ?? desiredName} (pid ${process.pid})`;
-			const phase = swarm.phase() ?? (identity ? swarm.begin(identity.phase, identity.label, by) : swarm.begin(randomUUID(), path.basename(cwd), by));
+			const phase = swarm.phase() ?? (identity ? swarm.begin(identity.phase, identity.label, by) : swarm.begin(randomUUID(), label ?? path.basename(cwd), by));
 			const placement = { ...place(), model, plugin: LOADED_VERSION };
 			const lead = swarm.lead();
 			if (identity?.phase !== phase.id) {
@@ -165,6 +204,12 @@ function place(): Pick<JoinOptions, "kitty" | "herdr"> {
  * body. The briefing a member gets on joining explains the header once, so each message is short.
  */
 export function formatForAgent(message: Message): string {
-	const header = { from: message.from, id: message.id, ...(message.replyTo ? { re: message.replyTo } : {}), ...(message.user ? { user: message.user } : {}) };
+	const header = {
+		from: message.from,
+		id: message.id,
+		...(message.replyTo ? { re: message.replyTo } : {}),
+		...(message.user ? { user: message.user } : {}),
+		...(message.interrupt ? { interrupt: true } : {}),
+	};
 	return `${JSON.stringify(header)}\n${message.body}`;
 }

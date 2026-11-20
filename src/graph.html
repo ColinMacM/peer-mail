@@ -67,7 +67,7 @@ function toast(text) {
 }
 
 async function focusMember(name) {
-  const response = await fetch(`/focus/${encodeURIComponent(name)}`, { method: "POST" });
+  const response = await fetch(`/focus/${encodeURIComponent(name)}${location.search}`, { method: "POST" });
   const body = await response.json();
   toast(response.ok ? `Opened ${name}` : body.error);
 }
@@ -190,7 +190,7 @@ function showMessages() {
 
 async function poll() {
   try {
-    state = await (await fetch("/state")).json();
+    state = await (await fetch(`/state${location.search}`)).json();
     document.getElementById("label").textContent = state.label ? `swarm · ${state.label}` : "no swarm running";
     const online = state.nodes.filter(node => node.online).length;
     document.getElementById("sub").textContent = state.startedAt

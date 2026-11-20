@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Membership } from "../src/inbox";
+import { formatForAgent, Membership } from "../src/inbox";
 import { StalePhaseError, Swarm, taskDone } from "../src/transport";
 
 let root: string;
@@ -10,7 +10,7 @@ let swarm: Swarm;
 
 beforeEach(() => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "peer-mail-"));
-	swarm = new Swarm(root);
+	swarm = new Swarm(root, "run");
 });
 
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -27,7 +27,7 @@ function otherHub(lead: Membership): Membership {
 
 test("/swarm joins the running swarm as an agent of its lead", () => {
 	const lead = Membership.start(swarm, "project_fix_robot", "lead", "/r");
-	const joiner = Membership.attach(new Swarm(root), "agent", "/r");
+	const joiner = Membership.attach(new Swarm(root, "run"), "agent", "/r");
 	expect(joiner.hub).toBe("lead");
 
 	expect(swarm.peers().map(peer => peer.name).sort()).toEqual(["agent", "lead"]);
@@ -42,12 +42,22 @@ test("only members can be addressed", () => {
 	expect(() => programmer.send("loner", "hi")).toThrow(/Can't send to "loner": the swarm has no such member/);
 });
 
+test("an interrupt is marked as one all the way to the agent's conversation", () => {
+	const hub = Membership.start(swarm, "s", "hub", "/r");
+	const agent = Membership.attach(swarm, "agent", "/r");
+	hub.send(agent.name, "stop and do t2", { interrupt: true });
+	hub.send(agent.name, "plain");
+	const [stop, plain] = agent.receive();
+	expect(formatForAgent(stop).split("\n")[0]).toContain('"interrupt":true');
+	expect(formatForAgent(plain)).not.toContain("interrupt");
+});
+
 test("/startswarm ends the previous phase: old members go stale and their mail is gone", () => {
 	const old = Membership.start(swarm, "first run", "programmer", "/r");
 	swarm.join("reviewer", old.peer.phase, "/x", { pid: deadPid() });
 	old.send("reviewer", "from the old run");
 
-	const fresh = Membership.start(new Swarm(root), "second run", "lead", "/r");
+	const fresh = Membership.start(new Swarm(root, "run"), "second run", "lead", "/r");
 
 	expect(swarm.peers().map(peer => peer.name)).toEqual(["lead"]);
 	expect(swarm.pending("reviewer")).toBe(0);
@@ -55,6 +65,60 @@ test("/startswarm ends the previous phase: old members go stale and their mail i
 	expect(() => old.receive()).toThrow(StalePhaseError);
 	expect(() => old.heartbeat()).toThrow(StalePhaseError);
 	expect(fresh.receive()).toEqual([]);
+});
+
+test("swarms run side by side: /startswarm [3.0.0] leaves 2.0.0 running, and each label's /swarm joins its own lead", () => {
+	const two = Swarm.named("2.0.0", root);
+	const three = Swarm.named("3.0.0", root);
+	const lead2 = Membership.start(two, "2.0.0", "lead2", "/r");
+	const lead3 = Membership.start(three, "3.0.0", "lead3", "/r");
+	const agent2 = Membership.attach(Swarm.named("2.0.0", root), "agent", "/r");
+	const agent3 = Membership.attach(Swarm.named("3.0.0", root), "agent", "/r");
+
+	expect([agent2.hub, agent3.hub]).toEqual(["lead2", "lead3"]);
+	expect(Swarm.all(root).map(swarm => swarm.phase()?.label)).toEqual(["2.0.0", "3.0.0"]);
+	// Mail stays inside a swarm, and the same name can be taken in each.
+	expect(agent2.name).toBe(agent3.name);
+	agent2.send("lead2", "for 2.0.0");
+	expect(() => agent3.send("lead2", "across")).toThrow(/no such member/);
+	expect(lead2.receive().map(message => message.body)).toEqual(["for 2.0.0"]);
+	expect(lead3.receive()).toEqual([]);
+	// Starting 3.0.0 afresh leaves 2.0.0 as it was.
+	Membership.start(Swarm.named("3.0.0", root), "3.0.0", "lead3", "/r");
+	expect(() => agent3.receive()).toThrow(StalePhaseError);
+	expect(two.peers().map(peer => peer.name).sort()).toEqual(["agent", "lead2"]);
+	agent2.send("lead2", "still here");
+	expect(lead2.receive().map(message => message.body)).toEqual(["still here"]);
+});
+
+test("older peer-mail's one swarm is joined where it is while it runs, and moves under its name once none of its members does", () => {
+	const legacy = path.join(root, "swarm");
+	const write = (file: string, value: unknown) => {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify(value));
+	};
+	write(path.join(legacy, "phase.json"), { id: "p1", label: "2.0.0", startedAt: 1, startedBy: "hub" });
+	const peer = { name: "hub", phase: "p1", pid: process.pid, host: os.hostname(), cwd: "/r", joinedAt: 1, seenAt: 1, hub: null };
+	write(path.join(legacy, "peers", "hub.json"), peer);
+	write(path.join(legacy, "plans", "hub.json"), [{ id: "t1", title: "kept" }]);
+	// Its hub still runs (on older code): /swarm [2.0.0] joins it there, as that hub's agent.
+	const agent = Membership.attach(Swarm.named("2.0.0", root), "agent", "/r");
+	expect([agent.swarm.dir, agent.hub]).toEqual([legacy, "hub"]);
+	expect(Swarm.all(root).map(swarm => swarm.dir)).toEqual([legacy]);
+	// Nobody runs any more: it moves under its name, plan and all.
+	agent.leave("closed");
+	write(path.join(legacy, "peers", "hub.json"), { ...peer, pid: deadPid() });
+	const [adopted] = Swarm.all(root);
+	expect([adopted.dir, adopted.phase()?.id, adopted.plan("hub")[0].title]).toEqual([path.join(root, "swarms", "2.0.0"), "p1", "kept"]);
+	expect(fs.existsSync(legacy)).toBe(false);
+});
+
+test("a spawned session finds the swarm whose hub left its request", () => {
+	const hub = Membership.start(Swarm.named("3.0.0", root), "3.0.0", "hub", "/r");
+	Membership.start(Swarm.named("2.0.0", root), "2.0.0", "other", "/r");
+	const request = hub.swarm.requestSpawn(hub.peer, "tester", "test it", []);
+	expect(Swarm.ofSpawn(request.id, root)?.name).toBe("3.0.0");
+	expect(Swarm.ofSpawn("no-such-request", root)).toBeUndefined();
 });
 
 test("mail is delivered once, in sending order, and kept as history", () => {
@@ -83,7 +147,7 @@ test("a name held by a running session gets a suffix; a dead session's name is t
 
 test("a stale session's late write doesn't put it back in the new phase", () => {
 	const old = Membership.start(swarm, "s", "ghost", "/g");
-	Membership.start(new Swarm(root), "s", "lead", "/r");
+	Membership.start(new Swarm(root, "run"), "s", "lead", "/r");
 	// Its heartbeat raced the restart and landed in the new directory with the old phase.
 	fs.writeFileSync(path.join(swarm.dir, "peers", "ghost.json"), JSON.stringify(old.peer));
 
@@ -135,7 +199,7 @@ test("a spawn request is used once and finds the member that joined for it", () 
 test("/startswarm throws away spawn requests that haven't been taken", () => {
 	const lead = Membership.start(swarm, "first", "lead", "/r");
 	const request = swarm.requestSpawn(lead.peer, "reviewer", "review", []);
-	Membership.start(new Swarm(root), "second", "lead", "/r");
+	Membership.start(new Swarm(root, "run"), "second", "lead", "/r");
 	expect(swarm.takeSpawn(request.id)).toBeUndefined();
 });
 

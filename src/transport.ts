@@ -1,20 +1,24 @@
 /**
- * The one shared swarm mailbox. Only sessions that joined the swarm can mail; every other
- * session is isolated.
+ * The shared swarm mailbox. It holds any number of swarms side by side, each named after its
+ * label (`/startswarm [2.0.0]` is the swarm `2.0.0`). Only sessions that joined a swarm can mail,
+ * and only within it; every other session is isolated.
  *
- *   <root>/swarm/phase.json                   the current phase: its label, who started it, when
- *   <root>/swarm/peers/<name>.json            a member: pid, cwd, phase, hub, last heartbeat
- *   <root>/swarm/inbox/<name>/<id>.json       mail waiting for <name>
- *   <root>/swarm/delivered/<name>/<id>.json   mail <name> has received (its history)
- *   <root>/swarm/spawns/<id>.json             a hub's request for a new vertex, until it starts
+ *   <root>/swarms/<swarm>/phase.json                   the current phase: its label, who started it, when
+ *   <root>/swarms/<swarm>/peers/<name>.json            a member: pid, cwd, phase, hub, last heartbeat
+ *   <root>/swarms/<swarm>/inbox/<name>/<id>.json       mail waiting for <name>
+ *   <root>/swarms/<swarm>/delivered/<name>/<id>.json   mail <name> has received (its history)
+ *   <root>/swarms/<swarm>/spawns/<id>.json             a hub's request for a new vertex, until it starts
  *
  * Members form a graph: hubs (joined by hand) and vertices (spawned by a hub). A vertex can
- * message only its hub; a hub can message its vertices and the other hubs.
+ * message only its hub; a hub can message its vertices and the other hubs of its swarm.
  *
- * `/startswarm` begins a new phase: the directory is deleted and recreated, so earlier members
- * and their mail are gone. A session still holding the old phase id is stale: its heartbeat,
- * sends and receives are refused, and anything it manages to write carries the old phase and is
- * ignored by the new one.
+ * `/startswarm` begins a new phase of one swarm: its directory is deleted and recreated, so its
+ * earlier members and their mail are gone; other swarms are untouched. A session still holding
+ * the old phase id is stale: its heartbeat, sends and receives are refused, and anything it
+ * manages to write carries the old phase and is ignored by the new one.
+ *
+ * Older peer-mail kept its one swarm in <root>/swarm. It is used there, under its label's name,
+ * while any of its members runs, and moves to swarms/<name> once none does (adoptLegacy).
  *
  * Files are written to a temp name and renamed into place, so a reader never sees half a message.
  * A message is received by renaming it from inbox/ to delivered/: rename is atomic, so exactly one
@@ -161,6 +165,8 @@ export interface SendOptions {
 	user?: string;
 	/** A copy for the record: it joins the recipient's next turn instead of starting or interrupting one. */
 	quiet?: boolean;
+	/** peer_interrupt: the recipient's work is stopped, running commands too, before this is delivered. */
+	interrupt?: boolean;
 }
 
 export interface Message {
@@ -174,6 +180,7 @@ export interface Message {
 	/** The user's own words, quoted verbatim from the sender's session. */
 	user?: string;
 	quiet?: boolean;
+	interrupt?: boolean;
 }
 
 /** How often a member refreshes its peers/ entry. */
@@ -198,6 +205,48 @@ let sendCounter = 0;
 export class StalePhaseError extends Error {
 	constructor() {
 		super("The swarm was restarted with /startswarm; this session is no longer in it.");
+	}
+}
+
+/** Whether a member's session runs: on this machine its pid decides, elsewhere its last heartbeat. */
+export function peerOnline(peer: Peer, now = Date.now()): boolean {
+	if (peer.pid === null) return false;
+	if (peer.host === os.hostname()) return pidAlive(peer.pid);
+	return now - peer.seenAt <= STALE_MS;
+}
+
+/** The name of the one swarm older peer-mail kept in <root>/swarm, if it is there. */
+function legacyName(root: string): string | undefined {
+	const phase = readJson<Phase>(path.join(root, "swarm", "phase.json"));
+	if (!phase) return undefined;
+	try {
+		return normalizeName(phase.label);
+	} catch {
+		return "swarm";
+	}
+}
+
+/**
+ * Move the one swarm older peer-mail kept in <root>/swarm to swarms/<its name>, once none of its
+ * members runs; until then it is used where it is (Swarm's constructor), so its running sessions
+ * and newer ones share it. A swarm already under that name is left alone, and so is the old one.
+ */
+function adoptLegacy(root: string): void {
+	const name = legacyName(root);
+	if (!name) return;
+	const legacy = path.join(root, "swarm");
+	const phase = readJson<Phase>(path.join(legacy, "phase.json"));
+	const running = listDir(path.join(legacy, "peers"))
+		.filter(file => file.endsWith(".json"))
+		.map(file => readJson<Peer>(path.join(legacy, "peers", file)))
+		.some(peer => peer !== undefined && peer.phase === phase?.id && peerOnline(peer));
+	const target = path.join(root, "swarms", name);
+	if (running || fs.existsSync(target)) return;
+	fs.mkdirSync(path.dirname(target), { recursive: true });
+	try {
+		fs.renameSync(legacy, target);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; // another session moved it
 	}
 }
 
@@ -253,12 +302,41 @@ export function listDir(dir: string): string[] {
 	}
 }
 
-/** The swarm mailbox. Every method that acts for a member checks that its phase is current. */
+/** One swarm of the mailbox. Every method that acts for a member checks that its phase is current. */
 export class Swarm {
 	readonly dir: string;
 
-	constructor(readonly root: string = defaultRoot()) {
-		this.dir = path.join(root, "swarm");
+	/**
+	 * The swarm `name` (a normalized label, see Swarm.named) in the mailbox at `root`: swarms/<name>,
+	 * or older peer-mail's <root>/swarm while that is where this swarm still lives.
+	 */
+	constructor(
+		readonly root: string,
+		readonly name: string,
+	) {
+		const own = path.join(root, "swarms", name);
+		this.dir = !fs.existsSync(own) && legacyName(root) === name ? path.join(root, "swarm") : own;
+	}
+
+	/** The swarm a label names: `2.0.0` → swarms/2.0.0. Throws for a label that can't name one. */
+	static named(label: string, root: string = defaultRoot()): Swarm {
+		return new Swarm(root, normalizeName(label));
+	}
+
+	/** Every swarm in the mailbox that has begun, oldest first. */
+	static all(root: string = defaultRoot()): Swarm[] {
+		adoptLegacy(root);
+		const legacy = legacyName(root);
+		const names = new Set([...listDir(path.join(root, "swarms")), ...(legacy ? [legacy] : [])]);
+		return [...names]
+			.map(name => new Swarm(root, name))
+			.filter(swarm => swarm.phase() !== undefined)
+			.sort((a, b) => (a.phase()?.startedAt ?? 0) - (b.phase()?.startedAt ?? 0));
+	}
+
+	/** The swarm whose hub left spawn request `id` (a session peer_spawn launched), if any. */
+	static ofSpawn(id: string, root: string = defaultRoot()): Swarm | undefined {
+		return Swarm.all(root).find(swarm => fs.existsSync(swarm.path("spawns", `${id}.json`)));
 	}
 
 	private path(...parts: string[]): string {
@@ -269,7 +347,7 @@ export class Swarm {
 		return readJson<Phase>(this.path("phase.json"));
 	}
 
-	/** Delete every member and message and begin a new phase. */
+	/** Delete this swarm's members and messages and begin a new phase; other swarms are untouched. */
 	start(label: string, by: string): Phase {
 		fs.rmSync(this.dir, { recursive: true, force: true });
 		return this.begin(randomUUID(), label, by);
@@ -286,7 +364,7 @@ export class Swarm {
 	}
 
 	/**
-	 * Run `fn` holding the join lock (outside swarm/, so /startswarm can't delete it), so that
+	 * Run `fn` holding the join lock (outside swarms/, so /startswarm can't delete it), so that
 	 * sessions running /swarm at once take turns: only one of them can find no lead and become it.
 	 */
 	exclusive<T>(fn: () => T): T {
@@ -328,9 +406,7 @@ export class Swarm {
 	}
 
 	isOnline(peer: Peer, now = Date.now()): boolean {
-		if (peer.pid === null) return false;
-		if (peer.host === os.hostname()) return pidAlive(peer.pid);
-		return now - peer.seenAt <= STALE_MS;
+		return peerOnline(peer, now);
 	}
 
 	/** The swarm's lead: the running hub that joined first. A /swarm with no place of its own joins it as an agent. */
@@ -490,6 +566,7 @@ export class Swarm {
 				...(options.replyTo ? { replyTo: options.replyTo } : {}),
 				...(options.user ? { user: options.user } : {}),
 				...(options.quiet ? { quiet: true } : {}),
+				...(options.interrupt ? { interrupt: true } : {}),
 			};
 			writeJson(this.path("inbox", recipient, `${id}.json`), message);
 			return message;
