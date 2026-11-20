@@ -66,6 +66,9 @@ NARROW_WIDTH = 60
 
 # Columns moved by one h or l press.
 SIDE_STEP = 4
+# Cells the pointer moves with the button held before a press in the swarm view is a drag
+# (which moves the page) rather than a click (which shows a box's details).
+DRAG_CELLS = 1
 
 # Seconds between checks of the pane next to Blueprint (an agent may start or quit).
 NEIGHBOR_SECONDS = 5
@@ -75,6 +78,18 @@ BANNER_SECONDS = 6
 ASK_COOLDOWN = 10
 # Unanswered checks in a row before the editor pane counts as closed by hand.
 PANE_MISSES = 2
+
+
+@dataclass
+class Drag:
+    """A press in the swarm view that may become a drag: where it started and what it moves."""
+
+    x: float
+    y: float
+    body: tuple[float, float]  # the page's scroll (x, y) at the press
+    fence: Widget | None  # a diagram wider than the page under the press, which scrolls sideways itself
+    fence_x: float
+    moved: bool = False
 
 
 def scroll_into_view(widget: Widget, region: Region) -> None:
@@ -298,6 +313,10 @@ class BlueprintApp(App[None]):
         Binding("escape", "point_done", "Done", key_display="esc"),
         # The swarm view: what the selected box stands for, with the hub's brief behind it.
         Binding("i", "detail", "Details"),
+        # The swarm view: zoom the drawing out (shorter labels, tighter layout) and in; ctrl+wheel too.
+        Binding("minus", "zoom(-1)", "Zoom", key_display="-/+"),
+        Binding("plus,equals_sign", "zoom(1)", show=False),
+        Binding("0", "zoom(0)", show=False),
         # Only offered when Blueprint knows the pane it was opened next to.
         Binding("a", "ask", "Ask"),
         Binding("o", "open_file", "Open"),
@@ -333,7 +352,15 @@ class BlueprintApp(App[None]):
         self._painted: object = None  # the overlay last drawn over the swarm, by its signature
         self._spun = ""  # the header's spinner frame last drawn
         self._settled: tuple | None = None  # (fence, motion revision, theme) once its frame stopped changing
+        # The swarm view moves with the mouse: drag the page or a wide diagram. That takes over
+        # the drag Textual would use to select text, which a swarm view has no use for.
+        self._drag: Drag | None = None
+        self._dragged = False  # the press just released was a drag: its click shows nothing
+        # The swarm view's zoom (sources/swarm.ZOOMS); a change wakes the swarm watcher to draw it.
+        self._zoom = 0
+        self._wake = asyncio.Event()
         if swarm is not None:
+            self.ALLOW_SELECT = False
             ask_on_open = False  # the hub never draws: the swarm view draws itself
         self.settings = settings or config_store.load()
         # The pane Blueprint was opened next to; None outside herdr.
@@ -435,7 +462,8 @@ class BlueprintApp(App[None]):
         """Follow the hub's swarm; when the hub opened its view in another pane, close."""
         assert self._swarm is not None and self._motion is not None
         try:
-            async for snapshot, doc, item in swarm_source.watch_swarm(self._swarm, os.environ.get("HERDR_PANE_ID")):
+            changes = swarm_source.watch_swarm(self._swarm, os.environ.get("HERDR_PANE_ID"), lambda: self._zoom, self._wake)
+            async for snapshot, doc, item in changes:
                 self._motion.update(snapshot, doc, time.time())
                 if item is not None:
                     await self.open_item(item)
@@ -499,6 +527,16 @@ class BlueprintApp(App[None]):
         """i while pointing: what the selected box stands for, with the brief behind it."""
         if self.pointing and self.parts:
             self._show_detail(self._node_of(self.parts[self.selected].id))
+
+    def action_zoom(self, step: int) -> None:
+        """- zooms the swarm drawing out, + in, 0 back to the default."""
+        levels = sorted(swarm_source.ZOOMS)
+        zoom = 0 if step == 0 else min(max(self._zoom + step, levels[0]), levels[-1])
+        if zoom == self._zoom:
+            return
+        self._zoom = zoom
+        self._wake.set()
+        self.notify(f"Zoom {zoom:+d}" if zoom else "Zoom reset", timeout=1)
 
     def _show_detail(self, node: swarm_source.Node | None) -> None:
         snapshot = self._motion.snapshot if self._motion else None
@@ -715,6 +753,8 @@ class BlueprintApp(App[None]):
             return False
         if action == "detail":
             return self._swarm is not None and self.pointing
+        if action == "zoom":
+            return self._swarm is not None and not self._noting
         if action in ("point_ask", "point_done"):
             return self.pointing
         if action == "jump_code":
@@ -1570,6 +1610,58 @@ class BlueprintApp(App[None]):
                 self._select(i)
                 return
 
+    async def on_event(self, event: events.Event) -> None:
+        # Raw mouse input, before Textual routes it to a widget: in the swarm view a press and drag
+        # moves the page, and ctrl+wheel (with or without shift) zooms (not while a box's details
+        # are open over it). A zoom is all that wheel does: Textual would scroll sideways for it.
+        if (
+            self._swarm is not None
+            and isinstance(event, events.MouseEvent)
+            and not event.is_forwarded
+            and self.screen is self.screen_stack[0]
+        ):
+            if isinstance(event, (events.MouseScrollUp, events.MouseScrollDown)) and event.ctrl:
+                self.action_zoom(1 if isinstance(event, events.MouseScrollUp) else -1)
+                return
+            self._pan(event)
+        await super().on_event(event)
+
+    def _pan(self, event: events.MouseEvent) -> None:
+        """Drag the swarm view: up and down moves the page; sideways moves the diagram under the
+        press when it is wider than the pane, else the page. Pointer and content move together."""
+        body = self.query_one("#body", VerticalScroll)
+        if isinstance(event, events.MouseDown):
+            self._drag, self._dragged = None, False
+            if event.button != 1:
+                return
+            try:
+                widget, _region = self.screen.get_widget_at(int(event.screen_x), int(event.screen_y))
+            except Exception:
+                widget = None
+            while widget is not None and not isinstance(widget, MarkdownFence):
+                widget = widget.parent
+            fence = widget if widget is not None and widget.max_scroll_x > 0 else None
+            self._drag = Drag(event.screen_x, event.screen_y, (body.scroll_x, body.scroll_y), fence, fence.scroll_x if fence else 0)
+            return
+        drag = self._drag
+        if drag is None:
+            return
+        if isinstance(event, events.MouseUp) or (isinstance(event, events.MouseMove) and not event.button):
+            # Released (a release outside the pane shows up as a move with no button held).
+            self._dragged, self._drag = drag.moved, None
+            return
+        if not isinstance(event, events.MouseMove):
+            return
+        dx, dy = int(drag.x - event.screen_x), int(drag.y - event.screen_y)
+        if not drag.moved and abs(dx) < DRAG_CELLS and abs(dy) < DRAG_CELLS:
+            return
+        drag.moved = True
+        body.scroll_to(y=drag.body[1] + dy, animate=False, immediate=True)
+        if drag.fence is not None:
+            drag.fence.scroll_to(x=drag.fence_x + dx, animate=False, immediate=True)
+        else:
+            body.scroll_to(x=drag.body[0] + dx, animate=False, immediate=True)
+
     def on_click(self, event: events.Click) -> None:
         # A click on a document block points at it. Look under the mouse: a click
         # inside a fence (a scroll container) arrives here with the screen as its widget.
@@ -1577,8 +1669,10 @@ class BlueprintApp(App[None]):
             return  # the note is about the part selected now
         if self._swarm is not None and not self.pointing:
             # A box of the swarm shows what it stands for. Anywhere else a click does nothing: it
-            # mustn't start point mode, whose selection scrolls the page to the first box.
-            self._detail_at(event)
+            # mustn't start point mode, whose selection scrolls the page to the first box. The end
+            # of a drag isn't a click.
+            if not self._dragged:
+                self._detail_at(event)
             return
         try:
             widget, _region = self.screen.get_widget_at(event.screen_x, event.screen_y)

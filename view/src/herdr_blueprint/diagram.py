@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -18,6 +19,10 @@ from .themes import PALETTES, Palette
 
 # From roomy to compact: (padding_x, padding_y, gap). The first one that fits wins.
 _LAYOUTS = [(4, 2, 4), (2, 1, 3), (1, 0, 2)]
+# A source can pick its layout itself, whatever fits: a `%% layout: compact` line (the swarm
+# view's zoom). termaid ignores %% lines.
+LAYOUT_NAMES = {"roomy": _LAYOUTS[0], "normal": _LAYOUTS[1], "compact": _LAYOUTS[2]}
+_LAYOUT_LINE = re.compile(r"^\s*%% layout: (\w+)\s*$", re.MULTILINE)
 
 # termaid gets slow fast: a 200-node tree takes ~9 s. Larger sources are shown as text.
 MAX_DIAGRAM_CHARS = 10_000
@@ -135,8 +140,10 @@ def _render(source: str, theme_name: str, max_width: int | None) -> Drawing:
     # Cached because a diagram is redrawn on mount, theme change and resize.
     # Callers must not modify the returned Text.
     text = Text()
-    layout = _LAYOUTS[0]
-    for layout in _LAYOUTS:
+    named = _LAYOUT_LINE.search(source)
+    layouts = [LAYOUT_NAMES[named.group(1)]] if named and named.group(1) in LAYOUT_NAMES else _LAYOUTS
+    layout = layouts[0]
+    for layout in layouts:
         padding_x, padding_y, gap = layout
         try:
             text = render_rich(

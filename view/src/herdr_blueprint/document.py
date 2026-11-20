@@ -11,12 +11,16 @@ import re
 from collections.abc import Callable
 from functools import partial
 
+from rich.cells import cell_len
 from rich.text import Text
 from rich.style import Style
 from textual import events
-from textual.app import App
+from textual.app import App, ComposeResult
 from textual.content import Content
 from textual.message import Message
+from textual.strip import Strip
+from textual.visual import Visual
+from textual.widget import Widget
 from textual.widgets import Log, Markdown, Static
 from textual.widgets.markdown import MarkdownFence
 from textual.worker import get_current_worker
@@ -65,6 +69,78 @@ def failed(app: App, source: str, exc: DiagramError) -> Content:
     return Content.from_rich_text(notice + Text(source, style=palette.muted))
 
 
+class DrawingLines(Widget):
+    """A drawing in a fence, rendered a line at a time with each line's render kept.
+
+    Textual's Label renders all of its content again whenever anything about it changes, and
+    the pointer moving over it is such a change (its hover style). A big swarm drawing (hundreds
+    of columns, a hundred and more rows) took a tenth of a second for that, so every pointer
+    move and every animation frame held up scrolling and clicks. Here the pointer changes
+    nothing, and a repaint renders only the lines whose content changed.
+    """
+
+    DEFAULT_CSS = """
+    DrawingLines {
+        width: auto;
+        height: auto;
+        padding: 1 2;
+    }
+    MarkdownFence:ansi > DrawingLines {
+        padding: 1 0;
+    }
+    """
+
+    def __init__(self, source: Text | Content, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.auto_links = False
+        self._lines: list[Text | Content] = []
+        self._keys: list[object] = []  # what each line looks like, so an unchanged one keeps its render
+        self._width = 0
+        # Each line's render at a width, kept while a line like it is in the drawing.
+        self._strips: dict[tuple[object, int], Strip] = {}
+        self.update(source)
+
+    def update(self, source: Text | Content) -> None:
+        """Show `source`: a drawing as rich text (converted line by line, only the lines that
+        changed) or as content."""
+        if isinstance(source, Text):
+            lines: list[Text | Content] = list(source.split("\n", allow_blank=True))
+            keys: list[object] = [(line.plain, tuple(line.spans), line.style) for line in lines]
+            width = max((cell_len(line.plain) for line in lines), default=0)
+        else:
+            lines = list(source.split("\n", allow_blank=True))
+            keys = list(lines)
+            width = max((line.cell_length for line in lines), default=0)
+        resized = (width, len(lines)) != (self._width, len(self._lines))
+        kept = set(keys)
+        self._strips = {key: strip for key, strip in self._strips.items() if key[0] in kept}
+        self._lines, self._keys, self._width = lines, keys, width
+        self.refresh(layout=resized)
+
+    def notify_style_update(self) -> None:
+        self._strips.clear()  # rendered with the old colours
+        super().notify_style_update()
+
+    def get_content_width(self, container, viewport) -> int:
+        return self._width
+
+    def get_content_height(self, container, viewport, width: int) -> int:
+        return len(self._lines)
+
+    def render_line(self, y: int) -> Strip:
+        width = self.size.width
+        if not 0 <= y < len(self._lines):
+            return Strip.blank(width, self.visual_style.rich_style)
+        key = (self._keys[y], width)
+        strip = self._strips.get(key)
+        if strip is None:
+            line = self._lines[y]
+            content = Content.from_rich_text(line) if isinstance(line, Text) else line
+            strip = Visual.to_strips(self, content, width, 1, self.visual_style)[0]
+            self._strips[key] = strip
+        return strip
+
+
 class DiagramFence(MarkdownFence):
     """A fence that draws ```mermaid blocks and highlights all other code."""
 
@@ -90,7 +166,20 @@ class DiagramFence(MarkdownFence):
             if drawn is not None:
                 self.drawing = drawn
                 self._requested = (markdown.app.theme, width)
-                self._highlighted_code = Content.from_rich_text(drawn.text)
+                self._code_text = drawn.text
+
+    # What the fence shows, as Textual's MarkdownFence keeps it. A drawing is kept as rich text
+    # and made into content only when something asks for it: converting a whole big drawing on
+    # every animation frame cost more than drawing the frame.
+    @property
+    def _highlighted_code(self) -> Content:
+        if self._code_text is not None:
+            self._code_content, self._code_text = Content.from_rich_text(self._code_text), None
+        return self._code_content
+
+    @_highlighted_code.setter
+    def _highlighted_code(self, content: Content) -> None:
+        self._code_content, self._code_text = content, None
 
     class Drawn(Message):
         """A new drawing is on screen (first draw, theme change)."""
@@ -102,6 +191,26 @@ class DiagramFence(MarkdownFence):
     @property
     def is_mermaid(self) -> bool:
         return (self.lexer or "").strip().lower() == "mermaid"
+
+    def compose(self) -> ComposeResult:
+        if not self.is_mermaid:
+            yield from super().compose()
+            return
+        yield DrawingLines(self._code_text if self._code_text is not None else self._code_content, id="code-content")
+
+    def set_content(self, content: Content) -> None:
+        if not self.is_mermaid:
+            super().set_content(content)
+            return
+        self._content = self._highlighted_code = content
+        for lines in self.query("#code-content").results(DrawingLines):
+            lines.update(content)
+
+    def _show_text(self, text: Text) -> None:
+        """Show a drawing, kept as rich text (see _highlighted_code)."""
+        self._code_text = text
+        for lines in self.query("#code-content").results(DrawingLines):
+            lines.update(text)
 
     def on_mount(self) -> None:
         if self.is_mermaid and self.drawing is not None:
@@ -125,21 +234,21 @@ class DiagramFence(MarkdownFence):
         self.run_worker(partial(self._draw, width), thread=True, exclusive=True, group="draw")
 
     def _draw(self, width: int) -> None:
+        failure: Content | None = None
         try:
             drawing: Drawing | None = draw_diagram(self.code, palette_for_theme(self.app.theme), width)
-            content = Content.from_rich_text(drawing.text)
         except DiagramError as exc:
-            drawing, content = None, failed(self.app, self.code, exc)
+            drawing, failure = None, failed(self.app, self.code, exc)
         if not get_current_worker().is_cancelled:
-            self.app.call_from_thread(self._show, drawing, content)
+            self.app.call_from_thread(self._show, drawing, failure)
 
-    def _show(self, drawing: Drawing | None, content: Content) -> None:
+    def _show(self, drawing: Drawing | None, failure: Content | None) -> None:
         self.drawing = drawing
-        if drawing is not None and (self.shown or self.marked or self.overlay):
+        if drawing is None:
+            self.set_content(failure or Content(""))
+        else:
             # Redrawn (a theme change): keep the selection, the mark and the overlay.
-            content = Content.from_rich_text(painted(self.app, drawing, self.shown, self.marked, self.overlay))
-        self._highlighted_code = content
-        self.set_content(content)
+            self._show_text(painted(self.app, drawing, self.shown, self.marked, self.overlay))
         self.post_message(self.Drawn(self))
 
     def show(self, part: Part | None) -> None:
@@ -159,8 +268,7 @@ class DiagramFence(MarkdownFence):
 
     def _repaint(self) -> None:
         if self.drawing is not None:
-            self._highlighted_code = Content.from_rich_text(painted(self.app, self.drawing, self.shown, self.marked, self.overlay))
-            self.set_content(self._highlighted_code)
+            self._show_text(painted(self.app, self.drawing, self.shown, self.marked, self.overlay))
 
 
 class DocumentView(Markdown):

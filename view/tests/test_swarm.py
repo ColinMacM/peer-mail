@@ -3,9 +3,11 @@
 import json
 import os
 import socket
+import time
 from pathlib import Path
 
 import pytest
+from textual import events
 
 from herdr_blueprint import swarm_view
 from herdr_blueprint.app import BlueprintApp, NoteLine
@@ -29,7 +31,7 @@ def mailbox(tmp_path, monkeypatch) -> Path:
     """A swarm: hub `lead` (this process), a finished writer, a working tester, a plan with steps and a brief."""
     root = tmp_path / "peer-mail"
     monkeypatch.setenv("PEER_MAIL_DIR", str(root))
-    box = root / "swarm"
+    box = root / "swarms" / "run"
     write(box / "phase.json", {"id": "p1", "label": "run"})
     write(box / "peers/lead.json", peer("lead", None))
     write(box / "peers/writer.json", peer("writer", "lead", spawn="s1", finished=True, status="done"))
@@ -78,12 +80,64 @@ def test_the_plan_hangs_on_its_agents_and_the_hub_keeps_its_own_tasks(mailbox):
     assert swarm.read_snapshot(mailbox, 2**22 + 7, 0) is None
 
 
+def test_the_view_follows_its_hub_into_whichever_swarm_it_is_in(mailbox):
+    # Another swarm, listed first, whose hub is another session.
+    other = mailbox / "swarms" / "2.0.0"
+    write(other / "phase.json", {"id": "p2", "label": "2.0.0"})
+    write(other / "peers/hub.json", {**peer("hub", None), "phase": "p2", "pid": 2**22 + 7})
+    assert swarm.read_snapshot(mailbox, os.getpid(), 0).hub == "lead"
+    assert swarm.read_snapshot(mailbox, 2**22 + 7, 0).label == "2.0.0"
+
+
 def test_names_cannot_break_the_diagram():
     task = swarm.Task("t1", 'fix [arm] "now"', None, (), (), False)
     agent = swarm.Agent('x"]; click', "idle", tasks=(task,))
     doc = swarm.document(swarm.Snapshot("run", "lead", (), (agent,)))
     assert '  a0["x\'\'\' click · idle"]' in doc.diagram.splitlines()
     assert "'arm' 'now'" in doc.diagram
+
+
+def test_a_big_swarm_folds_its_oldest_finished_work_to_stay_drawable():
+    from herdr_blueprint.diagram import draw_diagram
+
+    def task(order: int, owner: str, done: bool, steps: int, done_steps: int) -> swarm.Task:
+        drawn = tuple(swarm.Step(f"step {i} of task {order}", i < done_steps, f"s{i}", code=f"src/m{order}.rs:{i}") for i in range(steps))
+        return swarm.Task(f"t{order}", f"task number {order}", owner, (f"t{order - 1}",) if order else (), drawn, done, order)
+
+    # Eight agents with three tasks each, oldest first: the first five finished all theirs.
+    agents = []
+    for a in range(8):
+        finished = a < 5
+        tasks = tuple(task(a * 3 + i, f"agent{a}", finished, 8, 8 if finished else 3) for i in range(3))
+        agents.append(swarm.Agent(f"agent{a}", "finished" if finished else "working", tasks=tasks))
+    snapshot = swarm.Snapshot("run", "lead", (), tuple(agents))
+    full, _nodes, _positions = swarm._draw(snapshot, swarm.Fold())
+    assert len(full) > swarm.FOLD_CHARS
+
+    doc = swarm.document(snapshot)
+    assert len(doc.diagram) <= swarm.FOLD_CHARS
+    draw_diagram(doc.diagram, get_palette("rose-pine"), 200)  # still drawn, not shown as text
+    assert "Older work folded to fit" in doc.markdown
+    shown_steps = {n.task for n in doc.nodes.values() if n.kind == "step"}
+    # The newest open work keeps its steps; the oldest finished work lost its steps first.
+    assert "t23" in shown_steps and "t0" not in shown_steps
+    # Every arrow and code line names a box that is drawn.
+    for line in doc.diagram.splitlines()[1:]:
+        words = line.split()
+        if "-->" in words or "-.->" in words:
+            assert words[0] in doc.nodes and words[2] in doc.nodes, line
+        elif words[:2] == ["%%", "code:"]:
+            assert words[2] in doc.nodes, line
+
+
+def test_a_folded_step_hands_its_branch_to_the_step_before_it():
+    steps = (swarm.Step("a", True, "s1"), swarm.Step("b", True, "s2"), swarm.Step("c", False, "s3", after="s2"))
+    t = swarm.Task("t1", "work", "w", (), steps, False)
+    snapshot = swarm.Snapshot("run", "lead", (), (swarm.Agent("w", "working", tasks=(t,)),))
+    diagram, nodes, _positions = swarm._draw(snapshot, swarm.Fold(trimmed={"t1"}))
+    node = next(n for n, v in nodes.items() if v.kind == "task")
+    assert f"  {node} --> {node}s2" in diagram.splitlines()
+    assert f"{node}s0" not in nodes and f"{node}s1" not in nodes
 
 
 def test_each_agent_goes_on_from_its_task_in_the_task_row(mailbox):
@@ -115,7 +169,7 @@ def test_a_still_swarm_paints_the_same_and_a_change_animates_then_settles(mailbo
     assert idle.overlay(idle.doc.diagram, (1, 0, 2), palette, 50)[0] == first
     assert not idle.moving(50)
     # A step gets done: it flashes, then settles.
-    write(mailbox / "swarm/steps/tester.json", {"t2": [{"title": "unit", "done": True}, {"title": "rig", "done": True}]})
+    write(mailbox / "swarms/run/steps/tester.json", {"t2": [{"title": "unit", "done": True}, {"title": "rig", "done": True}]})
     changed = swarm.read_snapshot(mailbox, os.getpid(), 100)
     motion.update(changed, swarm.document(changed), 100)
     assert motion.done_at[("t2", 1)] == 100 and motion.done_at[("t2", -1)] == 100
@@ -142,11 +196,11 @@ async def test_a_new_version_changes_only_what_changed_without_the_placeholder(m
         await wait_for(pilot, lambda: drawn_fence(app) is not None)
         document, fence = app.query_one(DocumentView), drawn_fence(app)
         # A new status shows in the table only: the drawing on screen stays the same widget.
-        write(mailbox / "swarm/peers/writer.json", peer("writer", "lead", spawn="s1", finished=True, status="all done"))
+        write(mailbox / "swarms/run/peers/writer.json", peer("writer", "lead", spawn="s1", finished=True, status="all done"))
         await wait_for(pilot, lambda: "all done" in app._shown_text)
         assert app.query_one(DocumentView) is document and drawn_fence(app) is fence
         # A step done changes the drawing: a new fence, drawn at once from the cache.
-        write(mailbox / "swarm/steps/tester.json", {"t2": [{"id": "s1", "title": "unit", "done": True}, {"id": "s2", "title": "rig", "done": True}]})
+        write(mailbox / "swarms/run/steps/tester.json", {"t2": [{"id": "s1", "title": "unit", "done": True}, {"id": "s2", "title": "rig", "done": True}]})
         await wait_for(pilot, lambda: "✓ rig" in app._shown_text)
         changed = next(f for f in app.query(DiagramFence) if f.is_mermaid)
         assert changed is not fence and changed.drawing is not None and PLACEHOLDER not in str(changed._highlighted_code)
@@ -179,6 +233,102 @@ async def test_a_click_on_a_task_shows_the_brief_behind_it(mailbox):
         await wait_for(pilot, lambda: isinstance(app.screen, swarm_view.SwarmDetail))
         assert "Write a.txt containing alpha." in app.screen.markdown
         assert "Brief from lead to writer" in app.screen.markdown
+
+
+def mouse(kind, x: int, y: int, button: int) -> events.MouseEvent:
+    """A raw mouse event as the terminal driver posts it."""
+    return kind(None, x, y, 0, 0, button, False, False, False, screen_x=x, screen_y=y)
+
+
+async def test_dragging_moves_the_page_and_a_wide_diagram_and_is_not_a_click(mailbox):
+    app = BlueprintApp(swarm=mailbox / "views/rec.json")
+    async with app.run_test(size=(40, 16)) as pilot:
+        await wait_for(pilot, lambda: drawn_fence(app) is not None)
+        await pilot.pause(0.3)
+        body, fence = app.query_one("#body"), drawn_fence(app)
+        assert body.max_scroll_y > 3 and fence.max_scroll_x > 6
+        body.scroll_to(y=fence.region.y - 2, animate=False)
+        await pilot.pause(0.1)
+        top, x, y = body.scroll_y, 20, 10
+        # Press on the diagram and pull up and to the left: the page goes down, the diagram right.
+        app.post_message(mouse(events.MouseDown, x, y, 1))
+        for step in range(1, 4):
+            app.post_message(mouse(events.MouseMove, x - 2 * step, y - step, 1))
+            await pilot.pause(0.05)
+        app.post_message(mouse(events.MouseUp, x - 6, y - 3, 1))
+        await pilot.pause(0.3)
+        assert (body.scroll_y, fence.scroll_x) == (top + 3, 6)
+        assert app.screen is app.screen_stack[0]  # no box's details opened
+        # A plain click still does what it did.
+        await pilot.click(offset=(x - 6, y - 3))
+        await pilot.pause(0.2)
+        assert body.scroll_y == top + 3
+
+
+async def test_the_pointer_and_an_animation_frame_rerender_only_what_changed(mailbox, monkeypatch):
+    from herdr_blueprint import document
+
+    rendered = []  # one entry per line of a drawing rendered
+    to_strips = document.Visual.to_strips
+
+    def counting(widget, *args, **kwargs):
+        if isinstance(widget, document.DrawingLines):
+            rendered.append(1)
+        return to_strips(widget, *args, **kwargs)
+
+    monkeypatch.setattr(document.Visual, "to_strips", staticmethod(counting))
+    app = BlueprintApp(swarm=mailbox / "views/rec.json")
+    async with app.run_test(size=(140, 60)) as pilot:
+        await wait_for(pilot, lambda: drawn_fence(app) is not None)
+        await pilot.pause(1.5)  # drawn, and the first animation settled
+        fence = drawn_fence(app)
+        lines = len(fence.drawing.text.plain.splitlines())
+        rendered.clear()
+        # The pointer sweeping over the drawing renders none of it again (Textual's Label did all of it, every move).
+        for x in range(10, 60, 2):
+            app.post_message(mouse(events.MouseMove, x, fence.region.y + 4, 0))
+        await pilot.pause(0.3)
+        assert rendered == []
+        # An agent's box pulsing re-renders the rows of that box, not the whole drawing.
+        motion = app._motion
+        motion.changed["tester"] = time.time()
+        app._play_motion()
+        await pilot.pause(0.2)
+        assert 0 < len(rendered) < lines / 2
+
+
+def test_each_zoom_level_draws_and_zooming_out_shrinks_the_drawing(mailbox):
+    from herdr_blueprint.diagram import LAYOUT_NAMES, draw_diagram
+
+    snapshot = swarm.read_snapshot(mailbox, os.getpid(), 0)
+    sizes = {}
+    for zoom, (_limit, layout) in swarm.ZOOMS.items():
+        drawing = draw_diagram(swarm.document(snapshot, zoom).diagram, get_palette("rose-pine"), 100)
+        lines = drawing.text.plain.splitlines()
+        sizes[zoom] = max(map(len, lines)) * len(lines)
+        if layout is not None:
+            assert drawing.padding == LAYOUT_NAMES[layout]
+    levels = sorted(sizes)
+    assert all(sizes[a] <= sizes[b] for a, b in zip(levels, levels[1:])), sizes
+    assert sizes[levels[0]] < sizes[0] < sizes[levels[-1]]
+    # Bird's-eye: a step is just its mark, a task its id.
+    lines = swarm.document(snapshot, levels[0]).diagram.splitlines()
+    assert any(line.endswith('["✓"]') for line in lines) and any('["✓ t1"]' in line for line in lines)
+
+
+async def test_minus_plus_and_ctrl_wheel_zoom_the_drawing(mailbox):
+    app = BlueprintApp(swarm=mailbox / "views/rec.json")
+    async with app.run_test(size=(140, 60)) as pilot:
+        await wait_for(pilot, lambda: drawn_fence(app) is not None)
+        width = drawn_fence(app).drawing.text.cell_len
+        await pilot.press("minus", "minus")
+        await wait_for(pilot, lambda: drawn_fence(app) is not None and drawn_fence(app).drawing.text.cell_len < width)
+        assert app._zoom == -2
+        fence = drawn_fence(app)
+        app.post_message(events.MouseScrollUp(None, 30, fence.region.y + 2, 0, 0, 0, False, False, True, screen_x=30, screen_y=fence.region.y + 2))
+        await wait_for(pilot, lambda: app._zoom == -1)
+        await pilot.press("0")
+        await wait_for(pilot, lambda: drawn_fence(app) is not None and drawn_fence(app).drawing.text.cell_len == width)
 
 
 async def test_a_note_about_an_agent_goes_to_the_hub_beside_the_view(mailbox):
